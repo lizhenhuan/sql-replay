@@ -1,0 +1,20 @@
+# Time: 2025-08-12T08:09:40.984905+08:00
+# User@Host: t1[t1] @ localhost [127.0.0.1]  Id:     9
+# Query_time: 0.000065  Lock_time: 0.000022 Rows_sent: 0  Rows_examined: 1
+SET timestamp=1724998168;
+UPDATE stock SET s_quantity = 86, s_ytd = s_ytd + 4, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + 0 WHERE s_i_id = 52521 AND s_w_id = 3;
+# Time: 2025-08-12T08:09:48.984905+08:00
+# User@Host: t1[t1] @ localhost [127.0.0.1]  Id:     6
+# Query_time: 0.000109  Lock_time: 0.000030 Rows_sent: 0  Rows_examined: 1
+SET timestamp=1724998168;
+UPDATE district SET d_next_o_id = 4172 + 1 WHERE d_id = 1 AND d_w_id = 6;
+# Time: 2024-08-30T06:09:28.060156Z
+# User@Host: t1[t1] @ localhost [127.0.0.1]  Id:     9
+# Query_time: 0.000065  Lock_time: 0.000022 Rows_sent: 0  Rows_examined: 1
+SET timestamp=1724998168;
+UPDATE stock SET s_quantity = 86, s_ytd = s_ytd + 4, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + 0 WHERE s_i_id = 52521 AND s_w_id = 3;
+# Time: 2024-08-30T06:09:28.060206Z
+# User@Host: t1[t1] @ localhost [127.0.0.1]  Id:     6
+# Query_time: 0.000109  Lock_time: 0.000030 Rows_sent: 0  Rows_examined: 1
+SET timestamp=1724998168;
+UPDATE district SET d_next_o_id = 4172 + 1 WHERE d_id = 1 AND d_w_id = 6;
