@@ -1,0 +1,10 @@
+
+# Time: 2025-08-14T08:00:53.793892+08:00
+# User@Host: root[root] @ localhost []  Id: 35131970
+# Query_time: 0.035144  Lock_time: 0.020995 Rows_sent: 326  Rows_examined: 326
+use information_schema;
+SET timestamp=1755129653;
+select * from tables;
+# Time: 2025-08-14T08:01:04.221658+08:00
+# User@Host: root[root] @ localhost []  Id: 35131974
+# Query_time: 0.001259  Lock_time: 0.000163 Rows_sent: 1  Rows_examined: 712

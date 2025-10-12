@@ -1,0 +1,1 @@
+{"connection_id":"35131970","query_time":35144,"sql":"select * from tables;","rows_sent":326,"username":"root","sql_type":"select","dbname":"","ts":1755129653.7938921,"digest":"4451c16f5ae2f95931c74a3403789e3fb5eba97c7c7a03828521b0f64e88b281"}
