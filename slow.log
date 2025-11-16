@@ -18,3 +18,29 @@ UPDATE stock SET s_quantity = 86, s_ytd = s_ytd + 4, s_order_cnt = s_order_cnt +
 # Query_time: 0.000109  Lock_time: 0.000030 Rows_sent: 0  Rows_examined: 1
 SET timestamp=1724998168;
 UPDATE district SET d_next_o_id = 4172 + 1 WHERE d_id = 1 AND d_w_id = 6;
+# Time: 2024-08-30T06:09:28.060206Z
+# User@Host: t1[t1] @ localhost [127.0.0.1]  Id:     6
+# Query_time: 0.000109  Lock_time: 0.000030 Rows_sent: 0  Rows_examined: 1
+SET timestamp=1724998168;
+SELECT
+  a.F_Id,
+  b.F_Code,
+  b.F_Name,
+  a.F_OnLineTime,
+  a.F_OffLineTime,
+  a.F_IsQuality,
+  c.F_FullName as IsQualityName,
+  a.F_IsAuto,
+  a.F_repairtimes,
+  a.F_WorkPlaceId,
+  a.F_CreatorTime,
+  'product' AS sourceType,
+  a.F_DeviceId
+  /*FROM qm_qualityprocessreportmain AS a*/
+from
+  qm_qualityprocessreportmain as a
+  LEFT JOIN pr_process b ON a.F_WorkPlaceId = b.F_Id
+  left join base_dictionarydata as c on a.F_IsQuality = c.F_EnCode 
+  -- LEFT JOIN DM_Device AS d ON a.F_DeviceId = d.F_Id         
+  -- LEFT JOIN base_user as e on a.F_OperatorId=e.F_Id         
+  WHERE a.F_DeleteMark = 0         and c.F_DictionaryTypeId ='43acaebf4942499bb812f338151caf21' and c.F_EnabledMark = 1                       and             (                 a.F_ProductBaseId = '7df8ab2f6a1b45ddbb699257760e74d6'             );

@@ -15,7 +15,7 @@ import (
 
 func ParseLogs(slowLogPath, slowOutputPath string) {
 	if slowLogPath == "" || slowOutputPath == "" {
-		fmt.Println("Usage: ./sql-replay -mode parse -slow-in <path_to_slow_query_log> -slow-out <path_to_slow_output_file>")
+		fmt.Println("Usage: ./sql-replay -mode parsemysqlslow -slow-in <path_to_slow_query_log> -slow-out <path_to_slow_output_file>")
 		return
 	}
 
@@ -47,6 +47,7 @@ func ParseLogs(slowLogPath, slowOutputPath string) {
 	reTime := regexp.MustCompile(`Time: ([\d-T:.Z\+]+)`)
 	reUser := regexp.MustCompile(`User@Host: (\w+)\[`)
 	reConnectionID := regexp.MustCompile(`Id:\s*(\d+)`)
+	sqlComment := regexp.MustCompile(`^\s*--\s`)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -91,7 +92,7 @@ func ParseLogs(slowLogPath, slowOutputPath string) {
 			} else if strings.HasPrefix(line, "# Query_time:") {
 				processQueryTimeAndRowsSent(line, &currentEntry)
 			} else if !strings.HasPrefix(line, "#") {
-				if !(strings.HasPrefix(line, "SET timestamp=") || strings.HasPrefix(line, "-- ") || strings.HasPrefix(line, "use ")) {
+				if !(strings.HasPrefix(line, "SET timestamp=") || sqlComment.MatchString(line) || strings.HasPrefix(line, "use ")) {
 					sqlBuffer.WriteString(line + " ")
 				}
 			}
