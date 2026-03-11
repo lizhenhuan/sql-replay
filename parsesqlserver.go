@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/csv"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -14,40 +15,42 @@ import (
 	"github.com/pingcap/tidb/pkg/parser"
 )
 
-// SQLServerXEventRecord 对应 SQL Server Extended Events 导出的 CSV 格式
-// 字段顺序: event_time, duration_us, cpu_time_us, logical_reads, writes, row_count, session_id, database_name, username, sql_text
-type SQLServerXEventRecord struct {
-	EventTime     string // 事件时间
-	DurationUS    int64  // 执行时长 (微秒)
-	CPUTimeUS     int64  // CPU 时间 (微秒)
-	LogicalReads  int64  // 逻辑读次数
-	Writes        int64  // 写入次数
-	RowCount      int    // 返回行数
-	SessionID     string // 会话 ID
-	DatabaseName  string // 数据库名
-	Username      string // 用户名
-	SQLText       string // SQL 文本
+// XEventRow 对应客户导出的 CSV 格式
+// 列: UUID, UUID, event_name, event_data (XML), xel_path, offset, timestamp
+type XEventRow struct {
+	EventName  string // sql_statement_completed, rpc_completed 等
+	EventData  string // XML 格式的事件数据
+	Timestamp  string // 时间戳
+}
+
+// XEventData 解析 XML event_data
+type XEventData struct {
+	XMLName   xml.Name `xml:"event"`
+	Timestamp string   `xml:"timestamp,attr"`
+	Data      []struct {
+		Name  string `xml:"name,attr"`
+		Value string `xml:"value"`
+	} `xml:"data"`
+	Action []struct {
+		Name  string `xml:"name,attr"`
+		Value string `xml:"value"`
+	} `xml:"action"`
 }
 
 // ParseSQLServerXEvents 解析 SQL Server Extended Events 导出的 CSV 文件
-// CSV 格式要求:
-//   - 第一行为表头
-//   - 字段顺序: event_time, duration_us, cpu_time_us, logical_reads, writes, row_count, session_id, database_name, username, sql_text
-//   - 时间格式支持: "2006-01-02 15:04:05.0000000" 或 "2006-01-02 15:04:05"
+// CSV 格式来自: SELECT object_name, event_data FROM sys.fn_xe_file_target_read_file(...)
 func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 	if csvFilePath == "" || slowOutputPath == "" {
 		fmt.Println("Usage: ./sql-replay -mode parsesqlserver -slow-in <path_to_xevent_csv> -slow-out <path_to_slow_output_file>")
 		return
 	}
 
-	// 打开 CSV 文件
 	file, err := os.Open(csvFilePath)
 	if err != nil {
 		log.Fatal("Error opening CSV file:", err)
 	}
 	defer file.Close()
 
-	// 创建输出文件
 	outputFile, err := os.Create(slowOutputPath)
 	if err != nil {
 		fmt.Println("Error creating output file:", err)
@@ -55,58 +58,81 @@ func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 	}
 	defer outputFile.Close()
 
-	// 创建 CSV reader
 	reader := csv.NewReader(file)
-	reader.LazyQuotes = true        // 处理带引号的字段
-	reader.FieldsPerRecord = -1     // 允许字段数量可变
+	reader.LazyQuotes = true
+	reader.FieldsPerRecord = -1
 
-	// 读取表头
-	headers, err := reader.Read()
-	if err != nil {
-		log.Fatal("Error reading CSV header:", err)
-	}
-
-	// 打印表头信息
-	fmt.Fprintf(os.Stderr, "CSV headers: %v\n", headers)
-
-	// 建立字段索引映射
-	fieldIndex := buildFieldIndex(headers)
-
-	// 处理 CSV 记录
 	recordCount := 0
 	skippedCount := 0
+	lineNum := 0
 
 	for {
+		lineNum++
 		record, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			log.Printf("Error reading CSV record: %v", err)
+			log.Printf("Error reading CSV line %d: %v", lineNum, err)
 			continue
 		}
 
-		// 解析记录
-		xeventRecord, err := parseSQLServerRecord(record, fieldIndex)
+		// 跳过表头或格式不符的行
+		if len(record) < 4 {
+			skippedCount++
+			continue
+		}
+
+		// 第一行可能是客户自己的查询语句（SELECT...），跳过
+		if lineNum == 1 && strings.Contains(record[0], "SELECT") {
+			continue
+		}
+
+		// 解析行数据
+		// 格式: UUID, UUID, event_name, event_data_xml, xel_path, offset, timestamp
+		var eventName, eventData, timestamp string
+		
+		// 根据列数确定格式
+		if len(record) >= 7 {
+			eventName = record[2]
+			eventData = record[3]
+			timestamp = record[6]
+		} else if len(record) >= 4 {
+			// 简化格式：event_name, event_data
+			eventName = record[0]
+			eventData = record[1]
+			if len(record) >= 3 {
+				timestamp = record[2]
+			}
+		} else {
+			skippedCount++
+			continue
+		}
+
+		// 只处理 sql_statement_completed 和 rpc_completed
+		if eventName != "sql_statement_completed" && eventName != "rpc_completed" {
+			skippedCount++
+			continue
+		}
+
+		// 解析 XML
+		logEntry, err := parseXEventData(eventName, eventData, timestamp)
 		if err != nil {
-			log.Printf("Error parsing record: %v", err)
+			log.Printf("Error parsing XML at line %d: %v", lineNum, err)
 			skippedCount++
 			continue
 		}
 
 		// 跳过空 SQL
-		if strings.TrimSpace(xeventRecord.SQLText) == "" {
+		if strings.TrimSpace(logEntry.SQL) == "" {
 			skippedCount++
 			continue
 		}
 
-		// 转换为 LogEntry 格式
-		logEntry := convertXEventToLogEntry(xeventRecord)
-
 		// 输出 JSON
 		jsonData, err := json.Marshal(logEntry)
 		if err != nil {
-			log.Printf("Error marshaling JSON: %v", err)
+			log.Printf("Error marshaling JSON at line %d: %v", lineNum, err)
 			skippedCount++
 			continue
 		}
@@ -118,190 +144,95 @@ func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 	fmt.Fprintf(os.Stderr, "Parse completed. Total records: %d, Skipped: %d\n", recordCount, skippedCount)
 }
 
-// buildFieldIndex 建立字段名到索引的映射
-// 支持多种可能的字段名写法
-func buildFieldIndex(headers []string) map[string]int {
-	index := make(map[string]int)
-	
-	// 定义字段名的可能别名
-	fieldAliases := map[string][]string{
-		"event_time":    {"event_time", "EventTime", "event time", "timestamp", "Timestamp"},
-		"duration_us":   {"duration_us", "DurationUS", "duration_us", "duration", "Duration"},
-		"cpu_time_us":   {"cpu_time_us", "CPUTimeUS", "cpu_time", "CPUTime"},
-		"logical_reads": {"logical_reads", "LogicalReads", "reads", "Reads"},
-		"writes":        {"writes", "Writes"},
-		"row_count":     {"row_count", "RowCount", "rows", "Rows", "row_count"},
-		"session_id":    {"session_id", "SessionID", "session_id", "spid", "SPID"},
-		"database_name": {"database_name", "DatabaseName", "db_name", "DBName", "database"},
-		"username":      {"username", "Username", "user_name", "UserName", "user"},
-		"sql_text":      {"sql_text", "SQLText", "statement", "Statement", "sql"},
+// parseXEventData 解析 XML 格式的 event_data
+func parseXEventData(eventName, eventDataXML, timestamp string) (*LogEntry, error) {
+	var xevent XEventData
+	if err := xml.Unmarshal([]byte(eventDataXML), &xevent); err != nil {
+		return nil, fmt.Errorf("XML parse error: %w", err)
 	}
 
-	for i, header := range headers {
-		header = strings.TrimSpace(header)
-		for fieldName, aliases := range fieldAliases {
-			for _, alias := range aliases {
-				if strings.EqualFold(header, alias) {
-					index[fieldName] = i
-					break
-				}
+	entry := &LogEntry{}
+
+	// 解析 timestamp (从 XML)
+	if xevent.Timestamp != "" {
+		if t, err := time.Parse(time.RFC3339Nano, xevent.Timestamp); err == nil {
+			entry.Timestamp = float64(t.Unix()) + float64(t.Nanosecond())/1e9
+		}
+	}
+
+	// 解析 data 字段
+	for _, d := range xevent.Data {
+		switch d.Name {
+		case "duration":
+			if val, err := strconv.ParseInt(d.Value, 10, 64); err == nil {
+				// SQL Server Extended Events duration 单位是微秒
+				entry.QueryTime = val
 			}
+		case "cpu_time":
+			// cpu_time 也是微秒
+		case "logical_reads":
+			// 逻辑读
+		case "row_count":
+			if val, err := strconv.Atoi(d.Value); err == nil {
+				entry.RowsSent = val
+			}
+		case "statement":
+			entry.SQL = cleanSQLText(d.Value)
 		}
 	}
 
-	return index
-}
-
-// parseSQLServerRecord 解析单条 CSV 记录
-func parseSQLServerRecord(record []string, index map[string]int) (*SQLServerXEventRecord, error) {
-	getField := func(name string) string {
-		if i, ok := index[name]; ok && i < len(record) {
-			return record[i]
-		}
-		return ""
-	}
-
-	xevent := &SQLServerXEventRecord{
-		EventTime:    getField("event_time"),
-		SessionID:    getField("session_id"),
-		DatabaseName: getField("database_name"),
-		Username:     getField("username"),
-		SQLText:      getField("sql_text"),
-	}
-
-	// 解析数值字段
-	if v := getField("duration_us"); v != "" {
-		// 支持微秒和毫秒两种格式
-		if val, err := strconv.ParseInt(v, 10, 64); err == nil {
-			// 如果值很大，可能是微秒；如果是小值，可能是毫秒，需要转换
-			xevent.DurationUS = val
+	// 解析 action 字段
+	for _, a := range xevent.Action {
+		switch a.Name {
+		case "username":
+			entry.Username = a.Value
+		case "session_id":
+			entry.ConnectionID = a.Value
+		case "database_name":
+			entry.DBName = a.Value
 		}
 	}
 
-	if v := getField("cpu_time_us"); v != "" {
-		if val, err := strconv.ParseInt(v, 10, 64); err == nil {
-			xevent.CPUTimeUS = val
-		}
-	}
-
-	if v := getField("logical_reads"); v != "" {
-		if val, err := strconv.ParseInt(v, 10, 64); err == nil {
-			xevent.LogicalReads = val
-		}
-	}
-
-	if v := getField("writes"); v != "" {
-		if val, err := strconv.ParseInt(v, 10, 64); err == nil {
-			xevent.Writes = val
-		}
-	}
-
-	if v := getField("row_count"); v != "" {
-		if val, err := strconv.Atoi(v); err == nil {
-			xevent.RowCount = val
-		}
-	}
-
-	return xevent, nil
-}
-
-// convertXEventToLogEntry 将 SQL Server XEvent 记录转换为 LogEntry 格式
-func convertXEventToLogEntry(xevent *SQLServerXEventRecord) *LogEntry {
-	// 解析时间戳
-	var timestamp float64
-	if xevent.EventTime != "" {
+	// 解析传入的 timestamp
+	if timestamp != "" && entry.Timestamp == 0 {
 		// 尝试多种时间格式
 		formats := []string{
 			"2006-01-02 15:04:05.0000000",
 			"2006-01-02 15:04:05.000000",
 			"2006-01-02 15:04:05.000",
 			"2006-01-02 15:04:05",
-			time.RFC3339,
-			time.RFC3339Nano,
 		}
-
-		var parsedTime time.Time
-		var err error
 		for _, format := range formats {
-			parsedTime, err = time.Parse(format, xevent.EventTime)
-			if err == nil {
+			if t, err := time.Parse(format, timestamp); err == nil {
+				entry.Timestamp = float64(t.Unix()) + float64(t.Nanosecond())/1e9
 				break
 			}
-		}
-
-		if err == nil {
-			timestamp = float64(parsedTime.Unix()) + float64(parsedTime.Nanosecond())/1e9
 		}
 	}
 
 	// 提取 SQL 类型
-	sqlType := extractSQLServerSQLType(xevent.SQLText)
+	entry.SQLType = extractSQLServerType(entry.SQL)
 
-	// 清理 SQL 文本
-	cleanedSQL := cleanSQLServerSQL(xevent.SQLText)
-
-	// 生成 SQL digest (fingerprint)
-	digest := generateSQLDigest(cleanedSQL)
-
-	return &LogEntry{
-		ConnectionID: xevent.SessionID,
-		QueryTime:    xevent.DurationUS, // 微秒
-		SQL:          cleanedSQL,
-		RowsSent:     xevent.RowCount,
-		Username:     xevent.Username,
-		SQLType:      sqlType,
-		DBName:       xevent.DatabaseName,
-		Timestamp:    timestamp,
-		Digest:       digest,
+	// 生成 digest
+	if entry.SQL != "" {
+		normalized := parser.Normalize(entry.SQL)
+		digest := parser.DigestNormalized(normalized)
+		entry.Digest = digest.String()
 	}
+
+	return entry, nil
 }
 
-// extractSQLServerSQLType 从 SQL Server SQL 文本中提取 SQL 类型
-func extractSQLServerSQLType(sqlText string) string {
-	if sqlText == "" {
-		return "other"
-	}
-
-	// 清理 SQL 文本
-	cleaned := strings.TrimSpace(sqlText)
-	cleaned = strings.Trim(cleaned, "\"'")
-	cleaned = strings.TrimSpace(cleaned)
-
-	// 转为大写便于匹配
-	upper := strings.ToUpper(cleaned)
-
-	// SQL Server 常见语句类型
-	switch {
-	case strings.HasPrefix(upper, "SELECT"):
-		return "select"
-	case strings.HasPrefix(upper, "INSERT"):
-		return "insert"
-	case strings.HasPrefix(upper, "UPDATE"):
-		return "update"
-	case strings.HasPrefix(upper, "DELETE"):
-		return "delete"
-	case strings.HasPrefix(upper, "EXEC") || strings.HasPrefix(upper, "EXECUTE"):
-		return "exec"
-	case strings.HasPrefix(upper, "CALL"):
-		return "call"
-	case strings.HasPrefix(upper, "WITH"):
-		return "select" // CTE 通常是 SELECT
-	default:
-		return "other"
-	}
-}
-
-// cleanSQLServerSQL 清理 SQL Server SQL 文本
-func cleanSQLServerSQL(sqlText string) string {
-	// 移除首尾空白和引号
-	cleaned := strings.TrimSpace(sqlText)
-	cleaned = strings.Trim(cleaned, "\"'")
-
-	// 替换 Windows 换行符
+// cleanSQLText 清理 SQL 文本
+func cleanSQLText(sql string) string {
+	// 移除多余的空白
+	cleaned := strings.TrimSpace(sql)
+	
+	// 替换换行符
 	cleaned = strings.ReplaceAll(cleaned, "\r\n", " ")
 	cleaned = strings.ReplaceAll(cleaned, "\n", " ")
-
-	// 压缩多余空白
+	
+	// 压缩多余空格
 	spaceBuf := make([]byte, 0, len(cleaned))
 	inSpace := false
 	for i := 0; i < len(cleaned); i++ {
@@ -315,19 +246,55 @@ func cleanSQLServerSQL(sqlText string) string {
 			inSpace = false
 		}
 	}
-
+	
 	return string(spaceBuf)
 }
 
-// generateSQLDigest 生成 SQL digest (fingerprint)
-func generateSQLDigest(sqlText string) string {
-	if sqlText == "" {
-		return ""
+// extractSQLServerType 从 SQL Server SQL 文本中提取 SQL 类型
+func extractSQLServerType(sql string) string {
+	if sql == "" {
+		return "other"
 	}
 
-	// 使用 TiDB parser 进行标准化
-	normalized := parser.Normalize(sqlText)
-	digest := parser.DigestNormalized(normalized)
-	
-	return digest.String()
+	cleaned := strings.TrimSpace(sql)
+	upper := strings.ToUpper(cleaned)
+
+	// 移除开头的 exec sp_executesql 或 exec sp_prepexec
+	if strings.HasPrefix(upper, "EXEC SP_EXECUTESQL") || strings.HasPrefix(upper, "EXEC SP_PREPEXEC") {
+		// 找到 N' 后面的 SQL
+		idx := strings.Index(upper, "N'")
+		if idx >= 0 {
+			remaining := upper[idx+2:]
+			// 找到下一个单引号
+			for i := 0; i < len(remaining); i++ {
+				if remaining[i] == '\'' {
+					upper = strings.TrimSpace(remaining[:i])
+					break
+				}
+			}
+		}
+	}
+
+	// 处理 exec proc_xxx 的情况
+	if strings.HasPrefix(upper, "EXEC ") || strings.HasPrefix(upper, "EXECUTE ") {
+		return "exec"
+	}
+
+	// 常见 SQL 类型
+	switch {
+	case strings.HasPrefix(upper, "SELECT"):
+		return "select"
+	case strings.HasPrefix(upper, "INSERT"):
+		return "insert"
+	case strings.HasPrefix(upper, "UPDATE"):
+		return "update"
+	case strings.HasPrefix(upper, "DELETE"):
+		return "delete"
+	case strings.HasPrefix(upper, "CALL"):
+		return "call"
+	case strings.HasPrefix(upper, "WITH"):
+		return "select" // CTE
+	default:
+		return "other"
+	}
 }
