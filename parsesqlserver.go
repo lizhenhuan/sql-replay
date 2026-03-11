@@ -223,7 +223,7 @@ func parseXEventData(eventName, eventDataXML, timestamp string) (*LogEntry, erro
 	return entry, nil
 }
 
-// cleanSQLText 清理 SQL 文本
+// cleanSQLText 清理 SQL 文本并转换 SQL Server 语法到 MySQL/TiDB 兼容格式
 func cleanSQLText(sql string) string {
 	// 移除多余的空白
 	cleaned := strings.TrimSpace(sql)
@@ -231,6 +231,9 @@ func cleanSQLText(sql string) string {
 	// 替换换行符
 	cleaned = strings.ReplaceAll(cleaned, "\r\n", " ")
 	cleaned = strings.ReplaceAll(cleaned, "\n", " ")
+	
+	// 转换 SQL Server 标识符引用 [name] -> `name`
+	cleaned = convertSQLServerIdentifiers(cleaned)
 	
 	// 压缩多余空格
 	spaceBuf := make([]byte, 0, len(cleaned))
@@ -248,6 +251,36 @@ func cleanSQLText(sql string) string {
 	}
 	
 	return string(spaceBuf)
+}
+
+// convertSQLServerIdentifiers 将 SQL Server 标识符语法转换为 MySQL/TiDB 兼容格式
+// [column_name] -> `column_name`
+// [schema].[table] -> `schema`.`table`
+func convertSQLServerIdentifiers(sql string) string {
+	var result strings.Builder
+	i := 0
+	
+	for i < len(sql) {
+		// 检查是否是标识符开始 [
+		if sql[i] == '[' {
+			// 找到匹配的 ]
+			end := strings.Index(sql[i+1:], "]")
+			if end >= 0 {
+				// 提取标识符名称
+				identifier := sql[i+1 : i+1+end]
+				// 写入 MySQL 格式 `identifier`
+				result.WriteByte('`')
+				result.WriteString(identifier)
+				result.WriteByte('`')
+				i = i + 1 + end + 1 // 跳过 [identifier]
+				continue
+			}
+		}
+		result.WriteByte(sql[i])
+		i++
+	}
+	
+	return result.String()
 }
 
 // extractSQLServerType 从 SQL Server SQL 文本中提取 SQL 类型
