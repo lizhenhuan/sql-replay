@@ -129,6 +129,21 @@ func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 			continue
 		}
 
+		// 跳过不支持的操作（UPDATE STATISTICS, ALTER INDEX 等）
+		upperSQL := strings.ToUpper(logEntry.SQL)
+		if strings.HasPrefix(upperSQL, "UPDATE STATISTICS") {
+			skippedCount++
+			continue
+		}
+		if strings.HasPrefix(upperSQL, "ALTER INDEX") {
+			skippedCount++
+			continue
+		}
+		if strings.HasPrefix(upperSQL, "BACKUP ") {
+			skippedCount++
+			continue
+		}
+
 		// 输出 JSON
 		jsonData, err := json.Marshal(logEntry)
 		if err != nil {
@@ -235,6 +250,18 @@ func cleanSQLText(sql string) string {
 	// 转换 SQL Server 标识符引用 [name] -> `name`
 	cleaned = convertSQLServerIdentifiers(cleaned)
 	
+	// 转换内置函数
+	cleaned = convertSQLServerFunctions(cleaned)
+	
+	// 转换 TOP N -> LIMIT N
+	cleaned = convertTopToLimit(cleaned)
+	
+	// 移除 N 前缀 (N'string' -> 'string')
+	cleaned = removeNPrefix(cleaned)
+	
+	// 移除 dbo. schema 前缀 (SQL Server: db.dbo.table -> TiDB: db.table)
+	cleaned = removeDboSchema(cleaned)
+	
 	// 压缩多余空格
 	spaceBuf := make([]byte, 0, len(cleaned))
 	inSpace := false
@@ -330,6 +357,234 @@ func removeWithHints(sql string) string {
 	}
 	
 	return result.String()
+}
+
+// convertSQLServerFunctions 转换 SQL Server 内置函数到 MySQL/TiDB 兼容格式
+func convertSQLServerFunctions(sql string) string {
+	upper := strings.ToUpper(sql)
+	result := sql
+	
+	// GETDATE() -> NOW()
+	if strings.Contains(upper, "GETDATE()") {
+		result = strings.ReplaceAll(result, "GETDATE()", "NOW()")
+		result = strings.ReplaceAll(result, "getdate()", "NOW()")
+		result = strings.ReplaceAll(result, "GetDate()", "NOW()")
+	}
+	
+	// GETUTCDATE() -> UTC_TIMESTAMP()
+	if strings.Contains(upper, "GETUTCDATE()") {
+		result = strings.ReplaceAll(result, "GETUTCDATE()", "UTC_TIMESTAMP()")
+		result = strings.ReplaceAll(result, "getutcdate()", "UTC_TIMESTAMP()")
+	}
+	
+	// ISNULL(a, b) -> IFNULL(a, b)
+	// 需要处理嵌套括号的情况
+	result = convertFunction(result, "ISNULL", "IFNULL")
+	
+	// LEN(string) -> LENGTH(string)
+	if strings.Contains(upper, "LEN(") {
+		// 注意：LEN 可能是单词的一部分，需要精确匹配
+		result = convertFunctionWithCheck(result, "LEN", "LENGTH", isLenFunction)
+	}
+	
+	// NEWID() -> UUID()
+	if strings.Contains(upper, "NEWID()") {
+		result = strings.ReplaceAll(result, "NEWID()", "UUID()")
+		result = strings.ReplaceAll(result, "newid()", "UUID()")
+	}
+	
+	return result
+}
+
+// convertFunction 转换函数名（处理嵌套括号）
+func convertFunction(sql, oldFunc, newFunc string) string {
+	upper := strings.ToUpper(sql)
+	result := sql
+	
+	idx := 0
+	for {
+		pos := strings.Index(upper[idx:], oldFunc+"(")
+		if pos == -1 {
+			break
+		}
+		pos += idx
+		
+		// 检查前面是否是单词边界
+		if pos > 0 {
+			prevChar := upper[pos-1]
+			if (prevChar >= 'A' && prevChar <= 'Z') || (prevChar >= 'a' && prevChar <= 'z') || (prevChar >= '0' && prevChar <= '9') || prevChar == '_' {
+				idx = pos + len(oldFunc)
+				continue
+			}
+		}
+		
+		// 替换函数名
+		result = result[:pos] + newFunc + result[pos+len(oldFunc):]
+		upper = strings.ToUpper(result)
+		idx = pos + len(newFunc)
+	}
+	
+	return result
+}
+
+// isLenFunction 检查 LEN 是否是函数调用
+func isLenFunction(sql string, pos int) bool {
+	upper := strings.ToUpper(sql)
+	// 检查前面是否是单词边界
+	if pos > 0 {
+		prevChar := upper[pos-1]
+		if (prevChar >= 'A' && prevChar <= 'Z') || (prevChar >= 'a' && prevChar <= 'z') || (prevChar >= '0' && prevChar <= '9') || prevChar == '_' {
+			return false
+		}
+	}
+	// 检查后面是否是 (
+	if pos+3 < len(sql) && upper[pos+3] == '(' {
+		return true
+	}
+	return false
+}
+
+// convertFunctionWithCheck 带检查的函数转换
+func convertFunctionWithCheck(sql, oldFunc, newFunc string, checkFunc func(string, int) bool) string {
+	result := sql
+	upper := strings.ToUpper(sql)
+	
+	idx := 0
+	for {
+		pos := strings.Index(upper[idx:], oldFunc)
+		if pos == -1 {
+			break
+		}
+		pos += idx
+		
+		if checkFunc(sql, pos) {
+			result = result[:pos] + newFunc + result[pos+len(oldFunc):]
+			upper = strings.ToUpper(result)
+			idx = pos + len(newFunc)
+		} else {
+			idx = pos + len(oldFunc)
+		}
+	}
+	
+	return result
+}
+
+// convertTopToLimit 将 SQL Server 的 TOP N 转换为 MySQL 的 LIMIT N
+func convertTopToLimit(sql string) string {
+	upper := strings.ToUpper(sql)
+	
+	// 查找 TOP 关键字
+	topIdx := strings.Index(upper, "TOP ")
+	if topIdx == -1 {
+		return sql
+	}
+	
+	// 检查 TOP 前面是否是 SELECT
+	if topIdx < 6 || !strings.Contains(upper[:topIdx+4], "SELECT") {
+		return sql
+	}
+	
+	// 提取 TOP 后面的数字
+	start := topIdx + 4
+	// 跳过空格
+	for start < len(sql) && (sql[start] == ' ' || sql[start] == '\t') {
+		start++
+	}
+	
+	// 读取数字
+	end := start
+	for end < len(sql) && ((sql[end] >= '0' && sql[end] <= '9') || sql[end] == '.') {
+		end++
+	}
+	
+	if end == start {
+		return sql
+	}
+	
+	topNumber := sql[start:end]
+	
+	// 检查是否有 PERCENT 关键字
+	remaining := strings.TrimSpace(upper[end:])
+	if strings.HasPrefix(remaining, "PERCENT") {
+		// TOP N PERCENT 需要特殊处理，暂时跳过
+		return sql
+	}
+	
+	// 查找 ORDER BY 位置
+	orderByIdx := strings.Index(upper, "ORDER BY")
+	
+	var result string
+	if orderByIdx == -1 {
+		// 没有 ORDER BY，直接在末尾添加 LIMIT
+		result = sql[:topIdx] + sql[end:] + " LIMIT " + topNumber
+	} else {
+		// 有 ORDER BY，需要找到 ORDER BY 的结束位置
+		// LIMIT 应该放在 ORDER BY 后面
+		result = sql[:topIdx] + sql[end:]
+		// LIMIT 已经在正确位置（ORDER BY 后面）
+		// 但我们需要确保 LIMIT 在最后
+		limitIdx := strings.Index(strings.ToUpper(result), "LIMIT")
+		if limitIdx == -1 {
+			result = result + " LIMIT " + topNumber
+		}
+	}
+	
+	return result
+}
+
+// removeNPrefix 移除 Unicode 字符串前缀 N'string' -> 'string'
+func removeNPrefix(sql string) string {
+	result := sql
+	i := 0
+	
+	for i < len(result)-2 {
+		if result[i] == 'N' || result[i] == 'n' {
+			// 检查后面是否是单引号
+			if result[i+1] == '\'' {
+				// 检查前面是否是单词边界
+				if i == 0 || result[i-1] == ' ' || result[i-1] == '(' || result[i-1] == ',' || result[i-1] == '=' {
+					result = result[:i] + result[i+1:]
+					continue
+				}
+			}
+		}
+		i++
+	}
+	
+	return result
+}
+
+// removeDboSchema 移除 SQL Server 的 dbo. schema 前缀
+// SQL Server: Database.dbo.Table -> TiDB: Database.Table
+func removeDboSchema(sql string) string {
+	// 模式1: `dbname`.`dbo`.`tablename` -> `dbname`.`tablename`
+	result := sql
+	for {
+		idx := strings.Index(result, ".`dbo`.")
+		if idx == -1 {
+			break
+		}
+		result = result[:idx] + result[idx+6:]  // 移除 .`dbo`
+	}
+	
+	// 模式2: `dbo`.`tablename` -> `tablename`
+	result = strings.ReplaceAll(result, "`dbo`.", "")
+	
+	// 模式3: dbname.dbo.tablename (无反引号) -> dbname.tablename
+	upper := strings.ToUpper(result)
+	for {
+		idx := strings.Index(upper, ".DBO.")
+		if idx == -1 {
+			break
+		}
+		result = result[:idx] + result[idx+4:]  // 移除 .dbo
+		upper = strings.ToUpper(result)
+	}
+	
+	// 模式4: dbo.tablename (无反引号) -> tablename
+	result = strings.ReplaceAll(result, "dbo.", "")
+	
+	return result
 }
 
 // extractSQLServerType 从 SQL Server SQL 文本中提取 SQL 类型

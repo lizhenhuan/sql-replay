@@ -99,7 +99,68 @@ func removeWithHints(sql string) string {
 
 ---
 
-## 3. 数据类型转换
+## 3. dbo. Schema 移除
+
+### 问题描述
+SQL Server 使用三段式命名 `Database.dbo.Table`，TiDB 只需要 `Database.Table`。
+
+### 示例
+```sql
+-- SQL Server
+SELECT * FROM Finance.dbo.ChargeItemMediCareItemCodeMapping
+SELECT * FROM dbo.ChargeItemMediCareItemCodeMapping
+
+-- TiDB
+SELECT * FROM Finance.ChargeItemMediCareItemCodeMapping
+SELECT * FROM ChargeItemMediCareItemCodeMapping
+```
+
+### 解决方案
+在 `parsesqlserver.go` 的 `removeDboSchema` 函数中移除：
+
+```go
+// 模式1: `dbname`.`dbo`.`tablename` -> `dbname`.`tablename`
+result = strings.ReplaceAll(result, ".`dbo`.", ".")
+
+// 模式2: `dbo`.`tablename` -> `tablename`
+result = strings.ReplaceAll(result, "`dbo`.", "")
+
+// 模式3: dbname.dbo.tablename -> dbname.tablename
+result = strings.ReplaceAll(result, ".dbo.", ".")
+```
+
+### 状态
+✅ 已修复
+
+---
+
+## 4. UPDATE STATISTICS 跳过
+
+### 问题描述
+`UPDATE STATISTICS` 是 SQL Server 的统计信息更新命令，TiDB 会自动维护统计信息，不需要手动执行。
+
+### 示例
+```sql
+-- SQL Server
+UPDATE STATISTICS dbo.AllocationPlan WITH FULLSCAN
+```
+
+### 解决方案
+在解析时跳过此类 SQL：
+
+```go
+if strings.HasPrefix(upperSQL, "UPDATE STATISTICS") {
+    skippedCount++
+    continue
+}
+```
+
+### 状态
+✅ 已跳过
+
+---
+
+## 5. 内置函数转换
 
 ### 问题描述
 SQL Server 和 TiDB 的数据类型名称不同。
@@ -310,8 +371,11 @@ SELECT * FROM Users ORDER BY ID LIMIT 20 OFFSET 10
 |--------|------|------|------|
 | P0 | 标识符 `[name]` | 所有 SQL | ✅ 已修复 |
 | P0 | `WITH(NOLOCK)` | 大量查询 | ✅ 已修复 |
-| P1 | `TOP N` | 分页查询 | ⏳ 待实现 |
-| P1 | 内置函数 | 部分查询 | ⏳ 待实现 |
+| P0 | `dbo.` Schema | 多表查询 | ✅ 已修复 |
+| P0 | `UPDATE STATISTICS` | 维护操作 | ✅ 已跳过 |
+| P1 | `TOP N` | 分页查询 | ✅ 已修复 |
+| P1 | 内置函数 | 部分查询 | ✅ 已修复 |
+| P1 | `N'string'` | Unicode 字符串 | ✅ 已修复 |
 | P2 | 存储过程 | 复杂业务 | ⚠️ 需手动处理 |
 | P2 | 临时表 | 复杂查询 | ⏳ 待实现 |
 | P3 | 分页语法 | 新版 SQL Server | ⏳ 待实现 |
