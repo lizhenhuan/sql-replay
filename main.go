@@ -13,7 +13,7 @@ var showVersion bool
 
 func main() {
 	var mode string
-	flag.StringVar(&mode, "mode", "", "Mode of operation: parsemysqlslow ,parsetidbslow , parsemysqlcsv, replay, load, report")
+	flag.StringVar(&mode, "mode", "", "Mode of operation: parsemysqlslow, parsetidbslow, parsemysqlcsv, parsesqlserver, replay, load, report")
 
 	// Define flags for various operation parameters
 	var slowLogPath, slowOutputPath, dbConnStr, replayOutputFilePath, filterUsername, filterSQLType, filterDBName, ignoreDigests, outDir, replayOut, tableName, Port string
@@ -56,6 +56,8 @@ func main() {
 		parseCSVLog(slowLogPath, slowOutputPath)
 	case "parsetidbslow":
 		ParseTiDBLogs(slowLogPath, slowOutputPath)
+	case "parsesqlserver":
+		ParseSQLServerXEvents(slowLogPath, slowOutputPath)
 	case "replay":
 		StartSQLReplay(dbConnStr, Speed, slowOutputPath, replayOutputFilePath, filterUsername, filterSQLType, filterDBName, ignoreDigests, lang)
 	case "load":
@@ -64,16 +66,17 @@ func main() {
 		Report(dbConnStr, replayOut, Port)
 
 	default:
-		fmt.Println("Invalid mode. Available modes: parse, replay, load, report")
+		fmt.Println("Invalid mode. Available modes: parsemysqlslow, parsemysqlcsv, parsetidbslow, parsesqlserver, replay, load, report")
 		os.Exit(1)
 	}
 }
 
 func printUsage() {
-	fmt.Println("Usage: ./sql-replay -mode [parse|replay|load|report]")
+	fmt.Println("Usage: ./sql-replay -mode [parsemysqlslow|parsemysqlcsv|parsetidbslow|parsesqlserver|replay|load|report]")
 	fmt.Println("    1. parse mysql slow log: ./sql-replay -mode parsemysqlslow -slow-in <path_to_slow_query_log> -slow-out <path_to_slow_output_file>")
 	fmt.Println("    2. parse tidb slow log: ./sql-replay -mode parsetidbslow -slow-in <path_to_slow_query_log> -slow-out <path_to_slow_output_file>")
-	fmt.Println("    3. replay mode: ./sql-replay -mode replay -db <mysql_connection_string> -speed 1.0 -slow-out <slow_output_file> -replay-out <replay_output_file> -username <all|username> -sqltype <all|select> -dbname <all|dbname> -ignoredigests <digest1,digest2...> -lang <en|zh>")
-	fmt.Println("    4. load mode: ./sql-replay -mode load -db <DB_CONN_STRING> -out-dir <DIRECTORY> -replay-name <REPORT_OUT_FILE_NAME> -table <replay_info>")
-	fmt.Println("    5. report mode: ./sql-replay -mode report -db <mysql_connection_string> -replay-name <replay name> -port ':8081'")
+	fmt.Println("    3. parse sql server xevent csv: ./sql-replay -mode parsesqlserver -slow-in <path_to_xevent_csv> -slow-out <path_to_slow_output_file>")
+	fmt.Println("    4. replay mode: ./sql-replay -mode replay -db <mysql_connection_string> -speed 1.0 -slow-out <slow_output_file> -replay-out <replay_output_file> -username <all|username> -sqltype <all|select> -dbname <all|dbname> -ignoredigests <digest1,digest2...> -lang <en|zh>")
+	fmt.Println("    5. load mode: ./sql-replay -mode load -db <DB_CONN_STRING> -out-dir <DIRECTORY> -replay-name <REPORT_OUT_FILE_NAME> -table <replay_info>")
+	fmt.Println("    6. report mode: ./sql-replay -mode report -db <mysql_connection_string> -replay-name <replay name> -port ':8081'")
 }
