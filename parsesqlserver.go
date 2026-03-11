@@ -256,6 +256,7 @@ func cleanSQLText(sql string) string {
 // convertSQLServerIdentifiers 将 SQL Server 标识符语法转换为 MySQL/TiDB 兼容格式
 // [column_name] -> `column_name`
 // [schema].[table] -> `schema`.`table`
+// WITH(NOLOCK) -> (移除)
 func convertSQLServerIdentifiers(sql string) string {
 	var result strings.Builder
 	i := 0
@@ -274,6 +275,54 @@ func convertSQLServerIdentifiers(sql string) string {
 				result.WriteByte('`')
 				i = i + 1 + end + 1 // 跳过 [identifier]
 				continue
+			}
+		}
+		result.WriteByte(sql[i])
+		i++
+	}
+	
+	// 移除 WITH(NOLOCK) / WITH (NOLOCK) 表提示
+	converted := result.String()
+	converted = removeWithHints(converted)
+	
+	return converted
+}
+
+// removeWithHints 移除 SQL Server 的 WITH(...) 表提示
+func removeWithHints(sql string) string {
+	// 匹配 WITH(...) 表提示，包括 NOLOCK, INDEX, TABLOCK 等
+	// 模式: WITH(NOLOCK), WITH (NOLOCK), WITH(NOLOCK, INDEX=xxx), WITH(TABLOCK)
+	
+	// 简单实现：逐个查找 WITH( 并移除到 )
+	result := strings.Builder{}
+	i := 0
+	upper := strings.ToUpper(sql)
+	
+	for i < len(sql) {
+		// 检查是否是 WITH(
+		if i+4 < len(sql) && upper[i:i+4] == "WITH" {
+			// 找 WITH 后面的 (
+			j := i + 4
+			for j < len(sql) && (sql[j] == ' ' || sql[j] == '\t') {
+				j++
+			}
+			if j < len(sql) && sql[j] == '(' {
+				// 找到匹配的 )
+				depth := 1
+				k := j + 1
+				for k < len(sql) && depth > 0 {
+					if sql[k] == '(' {
+						depth++
+					} else if sql[k] == ')' {
+						depth--
+					}
+					k++
+				}
+				if depth == 0 {
+					// 跳过 WITH(...)
+					i = k
+					continue
+				}
 			}
 		}
 		result.WriteByte(sql[i])
