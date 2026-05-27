@@ -19,6 +19,16 @@ func ParseTiDBLogs(slowLogPath, slowOutputPath string) {
 		return
 	}
 
+	outputFile, err := os.Create(slowOutputPath)
+	if err != nil {
+		fmt.Println("Error creating output file:", err)
+		return
+	}
+	defer outputFile.Close()
+
+	writer := bufio.NewWriterSize(outputFile, 8*1024*1024)
+	defer writer.Flush()
+
 	file, err := os.Open(slowLogPath)
 	if err != nil {
 		fmt.Println("Error opening file:", err)
@@ -26,16 +36,17 @@ func ParseTiDBLogs(slowLogPath, slowOutputPath string) {
 	}
 	defer file.Close()
 
-	var entries []LogEntry
-	bufferSize := 1024 * 1024 * 10 // 1MB
+	bufferSize := 1024 * 1024 * 10
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, bufferSize)
 	scanner.Buffer(buf, bufferSize)
 
 	var entry LogEntry
 	var isInternal bool
-	var sqlStatement string
-	var isPrepared string // 声明 isPrepared 变量
+	var sqlStatement strings.Builder
+	var isPrepared string
+	entryCount := 0
+
 	timeRegex := regexp.MustCompile(`# Time:\s+(\d+-\d+-\d+T\d+:\d+:\d+\.\d+[+-]\d+:\d+)`)
 	userHostRegex := regexp.MustCompile(`# User@Host:\s+(\w+)`)
 	connIDRegex := regexp.MustCompile(`# Conn_ID:\s+(\d+)`)
@@ -44,122 +55,97 @@ func ParseTiDBLogs(slowLogPath, slowOutputPath string) {
 	isInternalRegex := regexp.MustCompile(`# Is_internal:\s+(true|false)`)
 	preparedRegex := regexp.MustCompile(`# Prepared:\s+(true|false)`)
 
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// 检查是否为 Time 字段
-		if timeRegex.MatchString(line) {
-			if !isInternal { // 如果 Is_internal 为 true，跳过这个日志段落
-				if isPrepared == "true" {
-					entry.SQL = formatSQL(sqlStatement)
-				} else {
-					entry.SQL = sqlStatement
-				}
-				if entry.ConnectionID != "" && entry.SQL != "" { // 确保 entry 被正确填充
-					entries = append(entries, entry)
-				}
-			}
-
-			// 初始化新的日志段落
-			sqlStatement = ""
-			entry = LogEntry{}
-			isInternal = false
-			isPrepared = "false"
-
-			// 提取 Time 字段并转换为带时区的时间戳
-			match := timeRegex.FindStringSubmatch(line)
-			if match != nil {
-				parsedTime, err := time.Parse(time.RFC3339Nano, match[1])
-				if err == nil {
-					entry.Timestamp = float64(parsedTime.UnixNano()) / 1e9
-				} else {
-					fmt.Println("Error parsing time:", err)
-				}
-			}
-		} else if userHostRegex.MatchString(line) {
-			// 提取 Username
-			match := userHostRegex.FindStringSubmatch(line)
-			if match != nil {
-				entry.Username = match[1]
-			}
-		} else if connIDRegex.MatchString(line) {
-			// 提取 ConnectionID
-			match := connIDRegex.FindStringSubmatch(line)
-			if match != nil {
-				entry.ConnectionID = match[1]
-			}
-		} else if queryTimeRegex.MatchString(line) {
-			// 提取 QueryTime
-			match := queryTimeRegex.FindStringSubmatch(line)
-			if match != nil {
-				queryTime, _ := strconv.ParseFloat(match[1], 64)
-				entry.QueryTime = int64(queryTime * 1e6) // 转换为微秒
-			}
-		} else if dbRegex.MatchString(line) {
-			// 提取 DBName
-			match := dbRegex.FindStringSubmatch(line)
-			if match != nil {
-				entry.DBName = match[1]
-			}
-		} else if isInternalRegex.MatchString(line) {
-			// 检查是否为内部 SQL
-			match := isInternalRegex.FindStringSubmatch(line)
-			if match != nil && match[1] == "true" {
-				isInternal = true
-			}
-		} else if preparedRegex.MatchString(line) {
-			// 检查是否为预编译 SQL
-			match := preparedRegex.FindStringSubmatch(line)
-			if match != nil {
-				isPrepared = match[1]
-			}
-		} else if !strings.HasPrefix(line, "#") {
-			// 检查是否以 "use "（忽略大小写）开头
-			if !strings.HasPrefix(strings.ToLower(line), "use ") {
-				// 处理 SQL 语句
-				sqlStatement += strings.TrimSpace(line)
-				normalizedSQL := parser.Normalize(sqlStatement)
-				entry.Digest = parser.DigestNormalized(normalizedSQL).String()
-				words := strings.Fields(normalizedSQL)
-				entry.SQLType = "other"
-				if len(words) > 0 {
-					entry.SQLType = words[0]
-				}
-			}
+	flushEntry := func() {
+		if isInternal {
+			return
 		}
-	}
-
-	// 在处理最后一个日志段落的部分
-	if !isInternal {
+		sql := sqlStatement.String()
 		if isPrepared == "true" {
-			entry.SQL = formatSQL(sqlStatement)
-		} else {
-			entry.SQL = sqlStatement
+			sql = formatSQL(sql)
 		}
-		if entry.ConnectionID != "" && entry.SQL != "" { // 确保 entry 被正确填充
-			entries = append(entries, entry)
+		if entry.ConnectionID == "" || sql == "" {
+			return
 		}
-	}
-
-	outputFile, err := os.Create(slowOutputPath)
-	if err != nil {
-		fmt.Println("Error creating output file:", err)
-		return
-	}
-	defer outputFile.Close()
-
-	// 逐个输出 JSON 对象
-	for _, entry := range entries {
+		entry.SQL = sql
+		normalizedSQL := parser.Normalize(entry.SQL)
+		entry.Digest = parser.DigestNormalized(normalizedSQL).String()
+		words := strings.Fields(normalizedSQL)
+		entry.SQLType = "other"
+		if len(words) > 0 {
+			entry.SQLType = words[0]
+		}
 		jsonEntry, err := json.Marshal(entry)
 		if err != nil {
 			fmt.Println("Error marshaling JSON:", err)
 			return
 		}
-		outputFile.Write(jsonEntry)
-		outputFile.WriteString("\n")
+		fmt.Fprintln(writer, string(jsonEntry))
+		entryCount++
 	}
 
-	fmt.Println("Logs processed and written to output json")
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if timeRegex.MatchString(line) {
+			flushEntry()
+
+			sqlStatement.Reset()
+			entry = LogEntry{}
+			isInternal = false
+			isPrepared = "false"
+
+			match := timeRegex.FindStringSubmatch(line)
+			if match != nil {
+				parsedTime, err := time.Parse(time.RFC3339Nano, match[1])
+				if err == nil {
+					entry.Timestamp = float64(parsedTime.UnixNano()) / 1e9
+				}
+			}
+		} else if userHostRegex.MatchString(line) {
+			match := userHostRegex.FindStringSubmatch(line)
+			if match != nil {
+				entry.Username = match[1]
+			}
+		} else if connIDRegex.MatchString(line) {
+			match := connIDRegex.FindStringSubmatch(line)
+			if match != nil {
+				entry.ConnectionID = match[1]
+			}
+		} else if queryTimeRegex.MatchString(line) {
+			match := queryTimeRegex.FindStringSubmatch(line)
+			if match != nil {
+				queryTime, _ := strconv.ParseFloat(match[1], 64)
+				entry.QueryTime = int64(queryTime * 1e6)
+			}
+		} else if dbRegex.MatchString(line) {
+			match := dbRegex.FindStringSubmatch(line)
+			if match != nil {
+				entry.DBName = match[1]
+			}
+		} else if isInternalRegex.MatchString(line) {
+			match := isInternalRegex.FindStringSubmatch(line)
+			if match != nil && match[1] == "true" {
+				isInternal = true
+			}
+		} else if preparedRegex.MatchString(line) {
+			match := preparedRegex.FindStringSubmatch(line)
+			if match != nil {
+				isPrepared = match[1]
+			}
+		} else if !strings.HasPrefix(line, "#") {
+			if !strings.HasPrefix(strings.ToLower(line), "use ") {
+				sqlStatement.WriteString(strings.TrimSpace(line))
+			}
+		}
+	}
+
+	flushEntry()
+
+	if err := scanner.Err(); err != nil {
+		fmt.Println("Error reading file:", err)
+	}
+
+	fmt.Printf("Logs processed and written to output json, total entries: %d\n", entryCount)
 }
 
 // formatSQL 函数用于格式化 SQL 语句，替换 ? 占位符为对应的参数值。
