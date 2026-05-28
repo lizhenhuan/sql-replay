@@ -119,10 +119,10 @@ func ExecuteSQLAndRecord(task SQLTask, baseReplayOutputFilePath string) error {
 	return err
 }
 
-func ParseLogEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName string, ignoreDigestList []string) (map[string][]LogEntry, float64, error) {
+func streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName string, ignoreDigestList []string, dbConnStr, replayOutputFilePath string, speed float64, lang string) error {
 	inputFile, err := os.Open(slowOutputPath)
 	if err != nil {
-		return nil, 0, fmt.Errorf("file open error: %w", err)
+		return fmt.Errorf("file open error: %w", err)
 	}
 	defer inputFile.Close()
 
@@ -131,15 +131,21 @@ func ParseLogEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName
 	if err != nil {
 		fmt.Printf("Failed to open log file: %v\n", err)
 	}
-
-	defer logFile.Close()
+	if logFile != nil {
+		defer logFile.Close()
+	}
 
 	scanner := bufio.NewScanner(inputFile)
-	buf := make([]byte, 0, 512*1024*1024) // 512MB buffer
+	buf := make([]byte, 0, 512*1024*1024)
 	scanner.Buffer(buf, bufio.MaxScanTokenSize)
 
-	tasksMap := make(map[string][]LogEntry)
-	var minTimestamp float64 = 9999999999.999999
+	var (
+		connChans    = make(map[string]chan LogEntry)
+		connMu       sync.Mutex
+		wg           sync.WaitGroup
+		minTimestamp float64
+		minTSOnce    sync.Once
+	)
 
 	for scanner.Scan() {
 		var entry LogEntry
@@ -151,26 +157,46 @@ func ParseLogEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName
 		if filterUsername != "all" && entry.Username != filterUsername {
 			continue
 		}
-
 		if filterSQLType != "all" && entry.SQLType != filterSQLType {
 			continue
 		}
-
 		if filterDBName != "all" && entry.DBName != filterDBName {
 			continue
 		}
-		if contains(ignoreDigestList, entry.Digest) { // ignore input digests
-			fmt.Fprintf(logFile, "%s, %s\n", entry.Digest, entry.SQL)
+		if contains(ignoreDigestList, entry.Digest) {
+			if logFile != nil {
+				fmt.Fprintf(logFile, "%s, %s\n", entry.Digest, entry.SQL)
+			}
 			continue
 		}
-		tasksMap[entry.ConnectionID] = append(tasksMap[entry.ConnectionID], entry)
 
-		if entry.Timestamp < minTimestamp {
-			minTimestamp = entry.Timestamp
+		minTSOnce.Do(func() { minTimestamp = entry.Timestamp })
+
+		connMu.Lock()
+		ch, ok := connChans[entry.ConnectionID]
+		if !ok {
+			ch = make(chan LogEntry, 100)
+			connChans[entry.ConnectionID] = ch
+			wg.Add(1)
+			go replaySQLForConnection(entry.ConnectionID, ch, dbConnStr, replayOutputFilePath, minTimestamp, speed, lang, &wg)
 		}
+		connMu.Unlock()
+
+		ch <- entry
 	}
 
-	return tasksMap, minTimestamp, nil
+	if err := scanner.Err(); err != nil {
+		fmt.Println("Error reading input file:", err)
+	}
+
+	connMu.Lock()
+	for _, ch := range connChans {
+		close(ch)
+	}
+	connMu.Unlock()
+
+	wg.Wait()
+	return nil
 }
 
 func contains(slice []string, item string) bool {
@@ -182,24 +208,33 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-func ReplaySQLForConnection(connID string, entries []LogEntry, dbConnStr string, replayOutputFilePath string, minTimestamp float64, speed float64, lang string) {
+func replaySQLForConnection(connID string, ch <-chan LogEntry, dbConnStr string, replayOutputFilePath string, minTimestamp float64, speed float64, lang string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
 	db, err := sql.Open("mysql", dbConnStr)
 	if err != nil {
 		fmt.Printf(i18n.T(lang, "db_open_error")+"\n", connID, err)
+		for range ch {
+		}
 		return
 	}
 	defer db.Close()
 
-	var prevTimestamp float64 = entries[0].Timestamp - (entries[0].Timestamp - minTimestamp)
-	var lastQueryTime int64 = 0
+	var prevTimestamp float64
+	var lastQueryTime int64
+	firstEntry := true
 
-	for _, entry := range entries {
-		interval := (entry.Timestamp - prevTimestamp - float64(lastQueryTime)/1e6) / speed
-		if interval > 0 {
-			sleepDuration := time.Duration(interval * float64(time.Second))
-			time.Sleep(sleepDuration)
+	for entry := range ch {
+		if firstEntry {
+			prevTimestamp = entry.Timestamp - (entry.Timestamp - minTimestamp)
+			firstEntry = false
+		} else {
+			interval := (entry.Timestamp - prevTimestamp - float64(lastQueryTime)/1e6) / speed
+			if interval > 0 {
+				time.Sleep(time.Duration(interval * float64(time.Second)))
+			}
+			prevTimestamp = entry.Timestamp
 		}
-		prevTimestamp = entry.Timestamp
 
 		task := SQLTask{Entry: entry, DB: db}
 		if err := ExecuteSQLAndRecord(task, replayOutputFilePath); err != nil {
@@ -230,29 +265,12 @@ func StartSQLReplay(dbConnStr string, speed float64, slowOutputPath, replayOutpu
 	ts0 := time.Now()
 	fmt.Printf("[%s] %s\n", ts0.Format("2006-01-02 15:04:05.000"), i18n.T(lang, "parsing_start"))
 
-	tasksMap, minTimestamp, err := ParseLogEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName, ignoreDigestList)
-	if err != nil {
+	if err := streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName, ignoreDigestList, dbConnStr, replayOutputFilePath, speed, lang); err != nil {
 		fmt.Println(i18n.T(lang, "file_open_error"), err)
 		return
 	}
 
 	ts1 := time.Now()
-	fmt.Printf("[%s] %s, ", ts1.Format("2006-01-02 15:04:05.000"), i18n.T(lang, "parsing_complete"))
-	fmt.Printf("%s %v, ", i18n.T(lang, "parsing_time"), ts1.Sub(ts0))
-	fmt.Println(i18n.T(lang, "replay_start"))
-
-	var wg sync.WaitGroup
-
-	for connID, entries := range tasksMap {
-		wg.Add(1)
-		go func(connID string, entries []LogEntry) {
-			defer wg.Done()
-			ReplaySQLForConnection(connID, entries, dbConnStr, replayOutputFilePath, minTimestamp, speed, lang)
-		}(connID, entries)
-	}
-
-	wg.Wait()
-	ts2 := time.Now()
-	fmt.Printf("[%s] %s, ", ts2.Format("2006-01-02 15:04:05.000"), i18n.T(lang, "replay_complete"))
-	fmt.Printf("%s %v\n", i18n.T(lang, "replay_time"), ts2.Sub(ts1))
+	fmt.Printf("[%s] %s, ", ts1.Format("2006-01-02 15:04:05.000"), i18n.T(lang, "replay_complete"))
+	fmt.Printf("%s %v\n", i18n.T(lang, "replay_time"), ts1.Sub(ts0))
 }
