@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -59,6 +60,7 @@ type SQLTask struct {
 }
 
 var i18n *I18n
+var totalReplayed int64
 
 func init() {
 	var err error
@@ -141,10 +143,13 @@ func streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName s
 
 	var (
 		connChans    = make(map[string]chan LogEntry)
+		overflow     = make(map[string][]LogEntry)
 		connMu       sync.Mutex
 		wg           sync.WaitGroup
 		minTimestamp float64
 		minTSOnce    sync.Once
+		totalParsed  int64
+		parseStart   = time.Now()
 	)
 
 	for scanner.Scan() {
@@ -175,28 +180,72 @@ func streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName s
 		connMu.Lock()
 		ch, ok := connChans[entry.ConnectionID]
 		if !ok {
-			ch = make(chan LogEntry, 100)
+			ch = make(chan LogEntry, 1000)
 			connChans[entry.ConnectionID] = ch
 			wg.Add(1)
-			go replaySQLForConnection(entry.ConnectionID, ch, dbConnStr, replayOutputFilePath, minTimestamp, speed, lang, &wg)
+			go replaySQLForConnection(entry.ConnectionID, ch, overflow, connChans, dbConnStr, replayOutputFilePath, minTimestamp, speed, lang, &wg, &connMu)
 		}
 		connMu.Unlock()
 
-		ch <- entry
-	}
+		select {
+		case ch <- entry:
+		default:
+			connMu.Lock()
+			overflow[entry.ConnectionID] = append(overflow[entry.ConnectionID], entry)
+			connMu.Unlock()
+		}
 
-	if err := scanner.Err(); err != nil {
-		fmt.Println("Error reading input file:", err)
+		totalParsed++
+		if totalParsed%100000 == 0 {
+			elapsed := time.Since(parseStart).Seconds()
+			fmt.Printf("[%s] 解析进度: %d 条, %.0f 条/秒, %d 活跃连接\n",
+				time.Now().Format("15:04:05"), totalParsed, float64(totalParsed)/elapsed, len(connChans))
+		}
 	}
 
 	connMu.Lock()
+	activeConns := len(connChans)
 	for _, ch := range connChans {
 		close(ch)
 	}
 	connMu.Unlock()
 
-	wg.Wait()
-	return nil
+	replayStart := time.Now()
+	fmt.Printf("[%s] 解析完成: %d 条, 解析耗时 %v, 活跃连接 %d\n",
+		replayStart.Format("15:04:05"), totalParsed, replayStart.Sub(parseStart), activeConns)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var lastReplayed int64
+	lastTick := time.Now()
+	for {
+		select {
+		case <-done:
+			elapsed := time.Since(replayStart).Seconds()
+			replayed := atomic.LoadInt64(&totalReplayed)
+			fmt.Printf("[%s] 回放完成: %d/%d 条, 总耗时 %v, 平均 QPS %.0f\n",
+				time.Now().Format("15:04:05"), replayed, totalParsed, time.Since(parseStart), float64(replayed)/elapsed)
+			return nil
+		case <-ticker.C:
+			replayed := atomic.LoadInt64(&totalReplayed)
+			elapsed := time.Since(lastTick).Seconds()
+			qps := float64(replayed-lastReplayed) / elapsed
+			lastReplayed = replayed
+			lastTick = time.Now()
+			connMu.Lock()
+			conns := len(connChans)
+			connMu.Unlock()
+			fmt.Printf("[%s] 回放进度: %d/%d (%.1f%%), 活跃连接 %d, QPS %.0f\n",
+				time.Now().Format("15:04:05"), replayed, totalParsed, float64(replayed)/float64(totalParsed)*100, conns, qps)
+		}
+	}
 }
 
 func contains(slice []string, item string) bool {
@@ -208,8 +257,13 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-func replaySQLForConnection(connID string, ch <-chan LogEntry, dbConnStr string, replayOutputFilePath string, minTimestamp float64, speed float64, lang string, wg *sync.WaitGroup) {
-	defer wg.Done()
+func replaySQLForConnection(connID string, ch <-chan LogEntry, overflow map[string][]LogEntry, connChans map[string]chan LogEntry, dbConnStr string, replayOutputFilePath string, minTimestamp float64, speed float64, lang string, wg *sync.WaitGroup, connMu *sync.Mutex) {
+	defer func() {
+		connMu.Lock()
+		delete(connChans, connID)
+		connMu.Unlock()
+		wg.Done()
+	}()
 
 	db, err := sql.Open("mysql", dbConnStr)
 	if err != nil {
@@ -224,7 +278,7 @@ func replaySQLForConnection(connID string, ch <-chan LogEntry, dbConnStr string,
 	var lastQueryTime int64
 	firstEntry := true
 
-	for entry := range ch {
+	replayOne := func(entry LogEntry) {
 		if firstEntry {
 			prevTimestamp = entry.Timestamp - (entry.Timestamp - minTimestamp)
 			firstEntry = false
@@ -235,12 +289,24 @@ func replaySQLForConnection(connID string, ch <-chan LogEntry, dbConnStr string,
 			}
 			prevTimestamp = entry.Timestamp
 		}
-
 		task := SQLTask{Entry: entry, DB: db}
 		if err := ExecuteSQLAndRecord(task, replayOutputFilePath); err != nil {
 			fmt.Printf(i18n.T(lang, "sql_exec_error")+"\n", connID, err)
 		}
 		lastQueryTime = entry.QueryTime
+		atomic.AddInt64(&totalReplayed, 1)
+	}
+
+	for entry := range ch {
+		replayOne(entry)
+	}
+
+	connMu.Lock()
+	tail := overflow[connID]
+	delete(overflow, connID)
+	connMu.Unlock()
+	for _, entry := range tail {
+		replayOne(entry)
 	}
 }
 
