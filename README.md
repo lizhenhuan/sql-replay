@@ -69,12 +69,22 @@ unzip v0.3.4.zip
 ```
 # Parse MySQL Slow Log
 ./sql-replay -mode parsemysqlslow -slow-in /opt/slow.log -slow-out /opt/slow.format
-# Parse TiDB Slow Log
+# Parse MySQL Slow Log (multiple files with wildcard)
+./sql-replay -mode parsemysqlslow -slow-in '/opt/slow202607*.log' -slow-out /opt/slow.format
+# Parse TiDB Slow Log (single file)
 ./sql-replay -mode parsetidbslow -slow-in /opt/slow.log -slow-out /opt/slow.format
+# Parse TiDB Slow Log (multiple files with wildcard)
+./sql-replay -mode parsetidbslow -slow-in '/opt/slow202607*.log' -slow-out /opt/slow.format
+# Parse MySQL CSV Log (multiple files with wildcard)
+./sql-replay -mode parsemysqlcsv -slow-in '/opt/csv202607*.csv' -slow-out /opt/slow.format
+# Parse SQL Server XEvent CSV (multiple files with wildcard)
+./sql-replay -mode parsesqlserver -slow-in '/opt/xevent*.csv' -slow-out /opt/slow.format
+# Parse Tencent Cloud Audit CSV (multiple files with wildcard)
+./sql-replay -mode parsetencentaudit -slow-in '/opt/audit*.csv' -slow-out /opt/slow.format
 ```
-Note: 
+Note:
 1. /opt/slow.log is the path to the slow query log, slow.format is the output formatted file.
-2. TiDB slow logs are split by file. When replaying multiple slow log files, it is recommended to merge the output results into a single replay file in order.
+2. All parse modes support glob wildcard patterns for `-slow-in` (e.g. `'/opt/slow202607*.log'`, `'/opt/slow*.log'`). **Use quotes around the pattern to prevent shell expansion.** Matched files will be sorted by name and parsed sequentially into a single output file. Ensure file names follow a naming convention that preserves chronological order when sorted alphabetically.
 
 ## 2. Connect to Target Database for Replay
 ```

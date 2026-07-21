@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,16 +38,21 @@ type SQLServerXEventRecord struct {
 //   - 时间格式支持: "2006-01-02 15:04:05.0000000" 或 "2006-01-02 15:04:05"
 func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 	if csvFilePath == "" || slowOutputPath == "" {
-		fmt.Println("Usage: ./sql-replay -mode parsesqlserver -slow-in <path_to_xevent_csv> -slow-out <path_to_slow_output_file>")
+		fmt.Println("Usage: ./sql-replay -mode parsesqlserver -slow-in <path_to_xevent_csv_or_pattern> -slow-out <path_to_slow_output_file>")
 		return
 	}
 
-	// 打开 CSV 文件
-	file, err := os.Open(csvFilePath)
+	// Expand glob pattern; if no glob metacharacters, treat as a single file
+	files, err := filepath.Glob(csvFilePath)
 	if err != nil {
-		log.Fatal("Error opening CSV file:", err)
+		fmt.Println("Error expanding path pattern:", err)
+		return
 	}
-	defer file.Close()
+	if len(files) == 0 {
+		fmt.Printf("No files matched pattern: %s\n", csvFilePath)
+		return
+	}
+	sort.Strings(files)
 
 	// 创建输出文件
 	outputFile, err := os.Create(slowOutputPath)
@@ -55,6 +62,26 @@ func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 	}
 	defer outputFile.Close()
 
+	totalRecordCount := 0
+	totalSkippedCount := 0
+
+	for _, filePath := range files {
+		count, skipped := parseSingleSQLServerFile(filePath, outputFile)
+		totalRecordCount += count
+		totalSkippedCount += skipped
+	}
+
+	fmt.Fprintf(os.Stderr, "Parse completed. Total records: %d, Skipped: %d (from %d file(s))\n", totalRecordCount, totalSkippedCount, len(files))
+}
+
+func parseSingleSQLServerFile(filePath string, outputFile *os.File) (int, int) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("Error opening CSV file %s: %v\n", filePath, err)
+		return 0, 0
+	}
+	defer file.Close()
+
 	// 创建 CSV reader
 	reader := csv.NewReader(file)
 	reader.LazyQuotes = true        // 处理带引号的字段
@@ -63,11 +90,12 @@ func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 	// 读取表头
 	headers, err := reader.Read()
 	if err != nil {
-		log.Fatal("Error reading CSV header:", err)
+		log.Printf("Error reading CSV header in %s: %v\n", filePath, err)
+		return 0, 0
 	}
 
 	// 打印表头信息
-	fmt.Fprintf(os.Stderr, "CSV headers: %v\n", headers)
+	fmt.Fprintf(os.Stderr, "CSV headers [%s]: %v\n", filePath, headers)
 
 	// 建立字段索引映射
 	fieldIndex := buildFieldIndex(headers)
@@ -115,7 +143,8 @@ func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 		recordCount++
 	}
 
-	fmt.Fprintf(os.Stderr, "Parse completed. Total records: %d, Skipped: %d\n", recordCount, skippedCount)
+	fmt.Fprintf(os.Stderr, "Processed file: %s, records: %d, skipped: %d\n", filePath, recordCount, skippedCount)
+	return recordCount, skippedCount
 }
 
 // buildFieldIndex 建立字段名到索引的映射
