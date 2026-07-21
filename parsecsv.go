@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,16 +17,21 @@ import (
 
 func parseCSVLog(csvFilePath, slowOutputPath string) {
 	if csvFilePath == "" || slowOutputPath == "" {
-		fmt.Println("Usage: ./sql-replay -mode parsemysqlcsv -slow-in <path_to_csv_log> -slow-out <path_to_slow_output_file>")
+		fmt.Println("Usage: ./sql-replay -mode parsemysqlcsv -slow-in <path_to_csv_log_or_pattern> -slow-out <path_to_slow_output_file>")
 		return
 	}
 
-	// 打开CSV文件
-	file, err := os.Open(csvFilePath)
+	// Expand glob pattern; if no glob metacharacters, treat as a single file
+	files, err := filepath.Glob(csvFilePath)
 	if err != nil {
-		log.Fatal("Error creating output file:", err)
+		fmt.Println("Error expanding path pattern:", err)
+		return
 	}
-	defer file.Close()
+	if len(files) == 0 {
+		fmt.Printf("No files matched pattern: %s\n", csvFilePath)
+		return
+	}
+	sort.Strings(files)
 
 	outputFile, err := os.Create(slowOutputPath)
 	if err != nil {
@@ -37,6 +44,27 @@ func parseCSVLog(csvFilePath, slowOutputPath string) {
 	bufWriter := bufio.NewWriterSize(outputFile, 64*1024)
 	defer bufWriter.Flush()
 
+	// 优化：json.Encoder 直接流式写入 bufWriter，避免每行 json.Marshal + string() + Fprintln 的两次全量拷贝。
+	jsonEncoder := json.NewEncoder(bufWriter)
+
+	totalRecordCount := 0
+
+	for _, filePath := range files {
+		count := parseSingleCSVFile(filePath, jsonEncoder)
+		totalRecordCount += count
+	}
+
+	fmt.Fprintf(os.Stderr, "parse success, total record: %d (from %d file(s))\n", totalRecordCount, len(files))
+}
+
+func parseSingleCSVFile(filePath string, jsonEncoder *json.Encoder) int {
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("Error opening file %s: %v\n", filePath, err)
+		return 0
+	}
+	defer file.Close()
+
 	// 创建CSV reader
 	reader := csv.NewReader(file)
 
@@ -44,17 +72,15 @@ func parseCSVLog(csvFilePath, slowOutputPath string) {
 	reader.LazyQuotes = true
 	reader.FieldsPerRecord = -1 // 允许字段数量可变
 
-	// 优化：json.Encoder 直接流式写入 bufWriter，避免每行 json.Marshal + string() + Fprintln 的两次全量拷贝。
-	jsonEncoder := json.NewEncoder(bufWriter)
-
 	// 读取表头
 	headers, err := reader.Read()
 	if err != nil {
-		log.Fatal("read CSV header failed:", err)
+		log.Printf("read CSV header failed in %s: %v\n", filePath, err)
+		return 0
 	}
 
 	// 打印表头信息用于调试
-	fmt.Fprintf(os.Stderr, "CSV header: %v\n", headers)
+	fmt.Fprintf(os.Stderr, "CSV header [%s]: %v\n", filePath, headers)
 
 	// 处理CSV记录
 	recordCount := 0
@@ -97,8 +123,6 @@ func parseCSVLog(csvFilePath, slowOutputPath string) {
 			continue
 		}
 
-		// 优化：直接用 json.Encoder 写文件，省掉 json.Marshal + string() + Fprintln 的两次全量拷贝。
-		// Encode 内部流式写入 outputFile 并追加一个 '\n'，与原版 fmt.Fprintln(outputFile, string(jsonData)) 行为一致。
 		if err := jsonEncoder.Encode(jsonOutput); err != nil {
 			log.Printf("JSON encode failed : %v", err)
 			continue
@@ -106,7 +130,8 @@ func parseCSVLog(csvFilePath, slowOutputPath string) {
 		recordCount++
 	}
 
-	fmt.Fprintf(os.Stderr, "parse success， total record: %d \n", recordCount)
+	fmt.Fprintf(os.Stderr, "Processed file: %s, records: %d\n", filePath, recordCount)
+	return recordCount
 }
 
 // parseCSVRecord 解析CSV记录到结构体

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,9 +17,21 @@ import (
 
 func ParseTiDBLogs(slowLogPath, slowOutputPath string) {
 	if slowLogPath == "" || slowOutputPath == "" {
-		fmt.Println("Usage: ./sql-replay -mode parsetidbslow -slow-in <path_to_slow_query_log> -slow-out <path_to_slow_output_file>")
+		fmt.Println("Usage: ./sql-replay -mode parsetidbslow -slow-in <path_to_slow_query_log_or_pattern> -slow-out <path_to_slow_output_file>")
 		return
 	}
+
+	// Expand glob pattern; if no glob metacharacters, treat as a single file
+	files, err := filepath.Glob(slowLogPath)
+	if err != nil {
+		fmt.Println("Error expanding path pattern:", err)
+		return
+	}
+	if len(files) == 0 {
+		fmt.Printf("No files matched pattern: %s\n", slowLogPath)
+		return
+	}
+	sort.Strings(files)
 
 	outputFile, err := os.Create(slowOutputPath)
 	if err != nil {
@@ -29,10 +43,29 @@ func ParseTiDBLogs(slowLogPath, slowOutputPath string) {
 	writer := bufio.NewWriterSize(outputFile, 8*1024*1024)
 	defer writer.Flush()
 
-	file, err := os.Open(slowLogPath)
+	timeRegex := regexp.MustCompile(`# Time:\s+(\d+-\d+-\d+T\d+:\d+:\d+\.\d+[+-]\d+:\d+)`)
+	userHostRegex := regexp.MustCompile(`# User@Host:\s+(\w+)`)
+	connIDRegex := regexp.MustCompile(`# Conn_ID:\s+(\d+)`)
+	queryTimeRegex := regexp.MustCompile(`# Query_time:\s+(\d+\.\d+)`)
+	dbRegex := regexp.MustCompile(`# DB:\s+(\w+)`)
+	isInternalRegex := regexp.MustCompile(`# Is_internal:\s+(true|false)`)
+	preparedRegex := regexp.MustCompile(`# Prepared:\s+(true|false)`)
+
+	totalEntryCount := 0
+
+	for _, filePath := range files {
+		count := parseSingleTiDBSlowFile(filePath, writer, timeRegex, userHostRegex, connIDRegex, queryTimeRegex, dbRegex, isInternalRegex, preparedRegex)
+		totalEntryCount += count
+	}
+
+	fmt.Printf("Logs processed and written to output json, total entries: %d (from %d file(s))\n", totalEntryCount, len(files))
+}
+
+func parseSingleTiDBSlowFile(filePath string, writer *bufio.Writer, timeRegex, userHostRegex, connIDRegex, queryTimeRegex, dbRegex, isInternalRegex, preparedRegex *regexp.Regexp) int {
+	file, err := os.Open(filePath)
 	if err != nil {
-		fmt.Println("Error opening file:", err)
-		return
+		fmt.Printf("Error opening file %s: %v\n", filePath, err)
+		return 0
 	}
 	defer file.Close()
 
@@ -46,14 +79,6 @@ func ParseTiDBLogs(slowLogPath, slowOutputPath string) {
 	var sqlStatement strings.Builder
 	var isPrepared string
 	entryCount := 0
-
-	timeRegex := regexp.MustCompile(`# Time:\s+(\d+-\d+-\d+T\d+:\d+:\d+\.\d+[+-]\d+:\d+)`)
-	userHostRegex := regexp.MustCompile(`# User@Host:\s+(\w+)`)
-	connIDRegex := regexp.MustCompile(`# Conn_ID:\s+(\d+)`)
-	queryTimeRegex := regexp.MustCompile(`# Query_time:\s+(\d+\.\d+)`)
-	dbRegex := regexp.MustCompile(`# DB:\s+(\w+)`)
-	isInternalRegex := regexp.MustCompile(`# Is_internal:\s+(true|false)`)
-	preparedRegex := regexp.MustCompile(`# Prepared:\s+(true|false)`)
 
 	flushEntry := func() {
 		if isInternal {
@@ -142,10 +167,11 @@ func ParseTiDBLogs(slowLogPath, slowOutputPath string) {
 	flushEntry()
 
 	if err := scanner.Err(); err != nil {
-		fmt.Println("Error reading file:", err)
+		fmt.Printf("Error reading file %s: %v\n", filePath, err)
 	}
 
-	fmt.Printf("Logs processed and written to output json, total entries: %d\n", entryCount)
+	fmt.Printf("Processed file: %s, entries: %d\n", filePath, entryCount)
+	return entryCount
 }
 
 // formatSQL 函数用于格式化 SQL 语句，替换 ? 占位符为对应的参数值。

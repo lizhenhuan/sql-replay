@@ -66,13 +66,23 @@ unzip v0.3.4.zip
 ```
 # MySQL Slow Log
 ./sql-replay -mode parsemysqlslow -slow-in /opt/slow.log -slow-out /opt/slow.format
-# TiDB Slow Log
+# MySQL Slow Log（通配符匹配多个文件）
+./sql-replay -mode parsemysqlslow -slow-in '/opt/slow202607*.log' -slow-out /opt/slow.format
+# TiDB Slow Log（单个文件）
 ./sql-replay -mode parsetidbslow -slow-in /opt/slow.log -slow-out /opt/slow.format
+# TiDB Slow Log（通配符匹配多个文件）
+./sql-replay -mode parsetidbslow -slow-in '/opt/slow202607*.log' -slow-out /opt/slow.format
+# MySQL CSV Log（通配符匹配多个文件）
+./sql-replay -mode parsemysqlcsv -slow-in '/opt/csv202607*.csv' -slow-out /opt/slow.format
+# SQL Server XEvent CSV（通配符匹配多个文件）
+./sql-replay -mode parsesqlserver -slow-in '/opt/xevent*.csv' -slow-out /opt/slow.format
+# 腾讯云审计 CSV（通配符匹配多个文件）
+./sql-replay -mode parsetencentaudit -slow-in '/opt/audit*.csv' -slow-out /opt/slow.format
 ```
 
 说明：
 1. /opt/slow.log 为慢查询日志路径，slow.format 则为输出的格式化文件
-2. TiDB 慢日志按文件进行了切分，当需要回放多个慢日志文件时，建议将输出结果按照顺序合并为一个回放文件
+2. 所有 parse 模式的 `-slow-in` 参数均支持 glob 通配符（如 `'/opt/slow202607*.log'`、`'/opt/slow*.log'`），**使用时请用引号包裹通配符，避免 shell 提前展开**，匹配到的文件按文件名排序后依次解析，合并输出到一个文件。请确保文件名命名规范在按字典序排列时能保持时间顺序
 
 ## 2. 连接目标库回放
 

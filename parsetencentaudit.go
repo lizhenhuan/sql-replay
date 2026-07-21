@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,16 +35,21 @@ type sortedTencentAuditEntry struct {
 
 func ParseTencentAuditCSV(csvFilePath, slowOutputPath string) {
 	if csvFilePath == "" || slowOutputPath == "" {
-		fmt.Println("Usage: ./sql-replay -mode parsetencentaudit -slow-in <path_to_audit_csv> -slow-out <path_to_slow_output_file>")
+		fmt.Println("Usage: ./sql-replay -mode parsetencentaudit -slow-in <path_to_audit_csv_or_pattern> -slow-out <path_to_slow_output_file>")
 		return
 	}
 
-	file, err := os.Open(csvFilePath)
+	// Expand glob pattern; if no glob metacharacters, treat as a single file
+	files, err := filepath.Glob(csvFilePath)
 	if err != nil {
-		fmt.Println("Error opening file:", err)
+		fmt.Println("Error expanding path pattern:", err)
 		return
 	}
-	defer file.Close()
+	if len(files) == 0 {
+		fmt.Printf("No files matched pattern: %s\n", csvFilePath)
+		return
+	}
+	sort.Strings(files)
 
 	outputFile, err := os.Create(slowOutputPath)
 	if err != nil {
@@ -51,23 +58,58 @@ func ParseTencentAuditCSV(csvFilePath, slowOutputPath string) {
 	}
 	defer outputFile.Close()
 
+	var entries []sortedTencentAuditEntry
+	totalRows := 0
+	skippedRows := 0
+	rowOffset := 0
+
+	for _, filePath := range files {
+		var fileEntries []sortedTencentAuditEntry
+		fileTotalRows, fileSkippedRows := parseSingleTencentAuditFile(filePath, &fileEntries, rowOffset)
+		totalRows += fileTotalRows
+		skippedRows += fileSkippedRows
+		entries = append(entries, fileEntries...)
+		rowOffset += fileTotalRows
+	}
+
+	reverseTencentAuditEntriesIfDescending(entries)
+
+	for _, item := range entries {
+		jsonEntry, err := json.Marshal(item.Entry)
+		if err != nil {
+			fmt.Println("Error marshaling JSON:", err)
+			return
+		}
+		fmt.Fprintln(outputFile, string(jsonEntry))
+	}
+
+	fmt.Fprintf(os.Stderr, "Tencent audit CSV parsed. Total rows: %d, Written: %d, Skipped: %d (from %d file(s))\n", totalRows, len(entries), skippedRows, len(files))
+}
+
+func parseSingleTencentAuditFile(filePath string, entries *[]sortedTencentAuditEntry, rowOffset int) (int, int) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening file %s: %v\n", filePath, err)
+		return 0, 0
+	}
+	defer file.Close()
+
 	reader := csv.NewReader(file)
 	reader.LazyQuotes = true
 	reader.FieldsPerRecord = -1
 
 	headers, err := reader.Read()
 	if err != nil {
-		fmt.Println("Error reading CSV header:", err)
-		return
+		fmt.Fprintf(os.Stderr, "Error reading CSV header in %s: %v\n", filePath, err)
+		return 0, 0
 	}
 
 	fieldIndex, err := buildTencentAuditFieldIndex(headers)
 	if err != nil {
-		fmt.Println("Error parsing CSV header:", err)
-		return
+		fmt.Fprintf(os.Stderr, "Error parsing CSV header in %s: %v\n", filePath, err)
+		return 0, 0
 	}
 
-	var entries []sortedTencentAuditEntry
 	totalRows := 0
 	skippedRows := 0
 
@@ -96,24 +138,14 @@ func ParseTencentAuditCSV(csvFilePath, slowOutputPath string) {
 			continue
 		}
 
-		entries = append(entries, sortedTencentAuditEntry{
+		*entries = append(*entries, sortedTencentAuditEntry{
 			Entry:     *entry,
-			RowNumber: rowNumber,
+			RowNumber: rowOffset + rowNumber,
 		})
 	}
 
-	reverseTencentAuditEntriesIfDescending(entries)
-
-	for _, item := range entries {
-		jsonEntry, err := json.Marshal(item.Entry)
-		if err != nil {
-			fmt.Println("Error marshaling JSON:", err)
-			return
-		}
-		fmt.Fprintln(outputFile, string(jsonEntry))
-	}
-
-	fmt.Fprintf(os.Stderr, "Tencent audit CSV parsed. Total rows: %d, Written: %d, Skipped: %d\n", totalRows, len(entries), skippedRows)
+	fmt.Fprintf(os.Stderr, "Processed file: %s, total rows: %d, skipped: %d\n", filePath, totalRows, skippedRows)
+	return totalRows, skippedRows
 }
 
 func reverseTencentAuditEntriesIfDescending(entries []sortedTencentAuditEntry) {
