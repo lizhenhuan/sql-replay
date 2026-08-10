@@ -72,6 +72,10 @@ func ParseSQLServerXEvents(csvFilePath, slowOutputPath string) {
 	}
 
 	fmt.Fprintf(os.Stderr, "Parse completed. Total records: %d, Skipped: %d (from %d file(s))\n", totalRecordCount, totalSkippedCount, len(files))
+
+	if err := addCloseMarkers(slowOutputPath); err != nil {
+		fmt.Printf("Warning: failed to add close markers: %v\n", err)
+	}
 }
 
 func parseSingleSQLServerFile(filePath string, outputFile *os.File) (int, int) {
@@ -322,8 +326,10 @@ func extractSQLServerSQLType(sqlText string) string {
 
 // cleanSQLServerSQL 清理 SQL Server SQL 文本
 func cleanSQLServerSQL(sqlText string) string {
+	// Strip inline comments before newline removal to prevent `--` from eating subsequent SQL
+	cleaned := stripSQLInlineComments(sqlText)
 	// 移除首尾空白和引号
-	cleaned := strings.TrimSpace(sqlText)
+	cleaned = strings.TrimSpace(cleaned)
 	cleaned = strings.Trim(cleaned, "\"'")
 
 	// 替换 Windows 换行符

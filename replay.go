@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,7 @@ type LogEntry struct {
 	DBName       string  `json:"dbname"`
 	Timestamp    float64 `json:"ts"`
 	Digest       string  `json:"digest"`
+	CloseConn    bool    `json:"close_conn,omitempty"`
 }
 
 // CSVRecord 对应CSV的每一行
@@ -88,7 +90,47 @@ func init() {
 	}
 }
 
-func ExecuteSQLAndRecord(task SQLTask, baseReplayOutputFilePath string) error {
+type replayWriter struct {
+	path string
+	fh   *os.File
+	buf  *bufio.Writer
+}
+
+func newReplayWriter(basePath, connID string) (*replayWriter, error) {
+	path := fmt.Sprintf("%s.%s", basePath, connID)
+	fh, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, err
+	}
+	return &replayWriter{
+		path: path,
+		fh:   fh,
+		buf:  bufio.NewWriterSize(fh, 256*1024), // 256 KB write buffer
+	}, nil
+}
+
+func (w *replayWriter) writeRecord(record SQLExecutionRecord) error {
+	jsonData, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if _, err := w.buf.Write(jsonData); err != nil {
+		return err
+	}
+	return w.buf.WriteByte('\n')
+}
+
+func (w *replayWriter) close() error {
+	if w.buf != nil {
+		w.buf.Flush()
+	}
+	if w.fh != nil {
+		return w.fh.Close()
+	}
+	return nil
+}
+
+func executeSQLAndRecord(task SQLTask, w *replayWriter) error {
 	if task.DB == nil {
 		return fmt.Errorf("database connection is nil")
 	}
@@ -109,7 +151,7 @@ func ExecuteSQLAndRecord(task SQLTask, baseReplayOutputFilePath string) error {
 
 	executionTime := time.Since(startTime).Microseconds()
 
-	record := SQLExecutionRecord{
+	return w.writeRecord(SQLExecutionRecord{
 		SQL:           task.Entry.SQL,
 		QueryTime:     task.Entry.QueryTime,
 		RowsSent:      task.Entry.RowsSent,
@@ -117,26 +159,7 @@ func ExecuteSQLAndRecord(task SQLTask, baseReplayOutputFilePath string) error {
 		ExecutionTime: executionTime,
 		RowsReturned:  rowsReturned,
 		ErrorInfo:     errorInfo,
-	}
-
-	jsonData, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-
-	replayOutputFilePath := fmt.Sprintf("%s.%s", baseReplayOutputFilePath, task.Entry.ConnectionID)
-	file, err := os.OpenFile(replayOutputFilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	_, err = file.Write(jsonData)
-	if err != nil {
-		return err
-	}
-	_, err = file.WriteString("\n")
-	return err
+	})
 }
 
 func streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName string, ignoreDigestList []string, dbConnStr, replayOutputFilePath string, speed float64, lang string) error {
@@ -156,18 +179,20 @@ func streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName s
 	}
 
 	scanner := bufio.NewScanner(inputFile)
-	buf := make([]byte, 0, 512*1024*1024)
-	scanner.Buffer(buf, bufio.MaxScanTokenSize)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024) // 64 KB initial, 16 MB max per line
+
+	const overflowWarnLimit = 100000
 
 	var (
-		connChans    = make(map[string]chan LogEntry)
-		overflow     = make(map[string][]LogEntry)
-		connMu       sync.Mutex
-		wg           sync.WaitGroup
-		minTimestamp float64
-		minTSOnce    sync.Once
-		totalParsed  int64
-		parseStart   = time.Now()
+		connChans     = make(map[string]chan LogEntry)
+		overflow      = make(map[string][]LogEntry)
+		connMu        sync.Mutex
+		wg            sync.WaitGroup
+		minTimestamp  float64
+		minTSOnce     sync.Once
+		totalParsed   int64
+		parseStart    = time.Now()
+		connsClosedEarly int64
 	)
 
 	for scanner.Scan() {
@@ -198,26 +223,47 @@ func streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName s
 		connMu.Lock()
 		ch, ok := connChans[entry.ConnectionID]
 		if !ok {
-			ch = make(chan LogEntry, 1000)
+			ch = make(chan LogEntry, 10000)
 			connChans[entry.ConnectionID] = ch
 			wg.Add(1)
 			go replaySQLForConnection(entry.ConnectionID, ch, overflow, connChans, dbConnStr, replayOutputFilePath, minTimestamp, speed, lang, &wg, &connMu)
 		}
 		connMu.Unlock()
 
+		// Non-blocking send; fall back to overflow (same as original).
+		// Soft warn at overflowWarnLimit to signal high memory usage,
+		// but never block the parser — a single blocked send stalls
+		// ALL connections because the parser is the sole producer.
 		select {
 		case ch <- entry:
 		default:
 			connMu.Lock()
+			oLen := len(overflow[entry.ConnectionID])
+			if oLen == overflowWarnLimit {
+				fmt.Fprintf(os.Stderr, "[WARN] conn %s overflow reached %d, memory usage climbing\n", entry.ConnectionID, oLen)
+			}
 			overflow[entry.ConnectionID] = append(overflow[entry.ConnectionID], entry)
 			connMu.Unlock()
+		}
+
+		// If this entry has a close marker, close the channel immediately.
+		// The goroutine will drain buffered entries + overflow, then exit,
+		// freeing its DB connection and memory.
+		if entry.CloseConn {
+			connMu.Lock()
+			delete(connChans, entry.ConnectionID)
+			close(ch)
+			connMu.Unlock()
+			atomic.AddInt64(&connsClosedEarly, 1)
 		}
 
 		totalParsed++
 		if totalParsed%100000 == 0 {
 			elapsed := time.Since(parseStart).Seconds()
-			fmt.Printf("[%s] 解析进度: %d 条, %.0f 条/秒, %d 活跃连接\n",
-				time.Now().Format("15:04:05"), totalParsed, float64(totalParsed)/elapsed, len(connChans))
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			fmt.Printf("[%s] 解析进度: %d 条, %.0f 条/秒, %d 活跃连接, heap %.0fMB\n",
+				time.Now().Format("15:04:05"), totalParsed, float64(totalParsed)/elapsed, len(connChans), float64(m.HeapAlloc)/1024/1024)
 		}
 	}
 
@@ -229,8 +275,8 @@ func streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName s
 	connMu.Unlock()
 
 	replayStart := time.Now()
-	fmt.Printf("[%s] 解析完成: %d 条, 解析耗时 %v, 活跃连接 %d\n",
-		replayStart.Format("15:04:05"), totalParsed, replayStart.Sub(parseStart), activeConns)
+	fmt.Printf("[%s] 解析完成: %d 条, 解析耗时 %v, 剩余活跃连接 %d, 已提前关闭连接 %d\n",
+		replayStart.Format("15:04:05"), totalParsed, replayStart.Sub(parseStart), activeConns, atomic.LoadInt64(&connsClosedEarly))
 
 	done := make(chan struct{})
 	go func() {
@@ -260,8 +306,11 @@ func streamEntries(slowOutputPath, filterUsername, filterSQLType, filterDBName s
 			connMu.Lock()
 			conns := len(connChans)
 			connMu.Unlock()
-			fmt.Printf("[%s] 回放进度: %d/%d (%.1f%%), 活跃连接 %d, QPS %.0f\n",
-				time.Now().Format("15:04:05"), replayed, totalParsed, float64(replayed)/float64(totalParsed)*100, conns, qps)
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			fmt.Printf("[%s] 回放进度: %d/%d (%.1f%%), 活跃连接 %d, QPS %.0f, heap %.0fMB, goroutines %d\n",
+				time.Now().Format("15:04:05"), replayed, totalParsed, float64(replayed)/float64(totalParsed)*100, conns, qps,
+				float64(m.HeapAlloc)/1024/1024, runtime.NumGoroutine())
 		}
 	}
 }
@@ -292,6 +341,15 @@ func replaySQLForConnection(connID string, ch <-chan LogEntry, overflow map[stri
 	}
 	defer db.Close()
 
+	w, err := newReplayWriter(replayOutputFilePath, connID)
+	if err != nil {
+		fmt.Printf("[WARN] conn %s: cannot open output file: %v\n", connID, err)
+		for range ch {
+		}
+		return
+	}
+	defer w.close()
+
 	var prevTimestamp float64
 	var lastQueryTime int64
 	firstEntry := true
@@ -308,7 +366,7 @@ func replaySQLForConnection(connID string, ch <-chan LogEntry, overflow map[stri
 			prevTimestamp = entry.Timestamp
 		}
 		task := SQLTask{Entry: entry, DB: db}
-		if err := ExecuteSQLAndRecord(task, replayOutputFilePath); err != nil {
+		if err := executeSQLAndRecord(task, w); err != nil {
 			fmt.Printf(i18n.T(lang, "sql_exec_error")+"\n", connID, err)
 		}
 		lastQueryTime = entry.QueryTime

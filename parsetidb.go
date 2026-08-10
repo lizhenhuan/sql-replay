@@ -59,6 +59,10 @@ func ParseTiDBLogs(slowLogPath, slowOutputPath string) {
 	}
 
 	fmt.Printf("Logs processed and written to output json, total entries: %d (from %d file(s))\n", totalEntryCount, len(files))
+
+	if err := addCloseMarkers(slowOutputPath); err != nil {
+		fmt.Printf("Warning: failed to add close markers: %v\n", err)
+	}
 }
 
 func parseSingleTiDBSlowFile(filePath string, writer *bufio.Writer, timeRegex, userHostRegex, connIDRegex, queryTimeRegex, dbRegex, isInternalRegex, preparedRegex *regexp.Regexp) int {

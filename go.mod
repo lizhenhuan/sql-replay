@@ -3,7 +3,7 @@ module sql-replay
 go 1.20
 
 require (
-	bou.ke/monkey v1.0.2
+	github.com/agiledragon/gomonkey/v2 v2.14.2
 	github.com/go-sql-driver/mysql v1.7.1
 	github.com/pingcap/tidb/pkg/parser v0.0.0-20240126183920-6a87b80e2c8d
 )

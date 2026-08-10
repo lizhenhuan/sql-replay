@@ -51,6 +51,10 @@ func ParseLogs(slowLogPath, slowOutputPath string) {
 	}
 
 	fmt.Printf("Logs processed and written to output json (from %d file(s))\n", len(files))
+
+	if err := addCloseMarkers(slowOutputPath); err != nil {
+		fmt.Printf("Warning: failed to add close markers: %v\n", err)
+	}
 }
 
 func parseSingleMySQLSlowFile(filePath string, outputFile *os.File, reTime56, reTime, reUser, reConnectionID, sqlComment *regexp.Regexp) {
@@ -113,7 +117,7 @@ func parseSingleMySQLSlowFile(filePath string, outputFile *os.File, reTime56, re
 				processQueryTimeAndRowsSent(line, &currentEntry)
 			} else if !strings.HasPrefix(line, "#") {
 				if !(strings.HasPrefix(line, "SET timestamp=") || sqlComment.MatchString(line) || strings.HasPrefix(line, "use ")) {
-					sqlBuffer.WriteString(line + " ")
+					sqlBuffer.WriteString(stripInlineCommentFromLine(line) + " ")
 				}
 			}
 		}

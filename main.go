@@ -3,7 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+
+	_ "net/http/pprof"
 )
 
 // Version information for the SQL Replay Tool
@@ -21,6 +24,9 @@ func main() {
 	var Speed float64
 	var lang string
 	var routeDryRun, routeSkipNoDBname, routeSkipSelf, routeNoProgress, routeNoLineCount, routeQuiet bool
+	var pprofAddr string
+
+	flag.StringVar(&pprofAddr, "pprof", "", "Start pprof HTTP server on this address (e.g. :6060) for flame graph capture")
 
 	flag.BoolVar(&showVersion, "version", false, "Show version info")
 	flag.StringVar(&slowLogPath, "slow-in", "", "Path to slow query log file")
@@ -52,6 +58,15 @@ func main() {
 	if showVersion {
 		fmt.Println("SQL Replay Tool Version:", version)
 		os.Exit(0)
+	}
+
+	// Start pprof server if requested
+	if pprofAddr != "" {
+		fmt.Printf("[pprof] listening on %s\n", pprofAddr)
+		fmt.Printf("[pprof] flame graph: go tool pprof http://%s/debug/pprof/profile?seconds=30\n", pprofAddr)
+		fmt.Printf("[pprof] heap:       go tool pprof http://%s/debug/pprof/heap\n", pprofAddr)
+		fmt.Printf("[pprof] goroutine:  go tool pprof http://%s/debug/pprof/goroutine\n", pprofAddr)
+		go http.ListenAndServe(pprofAddr, nil)
 	}
 
 	if mode == "" {

@@ -1,10 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -281,19 +282,39 @@ func processFiles(outDir, replayName, tableName string, db *sql.DB) error {
 }
 
 func processFile(filePath, fileName, tableName string, db *sql.DB) error {
-	fileContent, err := ioutil.ReadFile(filePath)
+	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("error reading file: %w", err)
 	}
+	defer f.Close()
 
-	lines := strings.Split(string(fileContent), "\n")
-	for i := 0; i < len(lines); i += batchSize {
-		end := min(i+batchSize, len(lines))
-		if err := insertBatch(lines[i:end], fileName, tableName, db); err != nil {
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024) // 64 KB initial, 16 MB max per line
+
+	var batch []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		batch = append(batch, line)
+		if len(batch) >= batchSize {
+			if err := insertBatch(batch, fileName, tableName, db); err != nil {
+				return fmt.Errorf("error inserting batch: %w", err)
+			}
+			batch = batch[:0]
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read error: %w", err)
+	}
+
+	// flush remaining
+	if len(batch) > 0 {
+		if err := insertBatch(batch, fileName, tableName, db); err != nil {
 			return fmt.Errorf("error inserting batch: %w", err)
 		}
 	}
-
 	return nil
 }
 
