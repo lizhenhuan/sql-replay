@@ -84,6 +84,10 @@ func ParseTencentAuditCSV(csvFilePath, slowOutputPath string) {
 	}
 
 	fmt.Fprintf(os.Stderr, "Tencent audit CSV parsed. Total rows: %d, Written: %d, Skipped: %d (from %d file(s))\n", totalRows, len(entries), skippedRows, len(files))
+
+	if err := addCloseMarkers(slowOutputPath); err != nil {
+		fmt.Printf("Warning: failed to add close markers: %v\n", err)
+	}
 }
 
 func parseSingleTencentAuditFile(filePath string, entries *[]sortedTencentAuditEntry, rowOffset int) (int, int) {
@@ -356,7 +360,8 @@ func parseTencentAuditTimeWithLayouts(value string, layouts []string) (time.Time
 }
 
 func cleanTencentAuditSQL(sqlText string) string {
-	cleaned := strings.TrimSpace(sqlText)
+	cleaned := stripSQLInlineComments(sqlText)
+	cleaned = strings.TrimSpace(cleaned)
 	cleaned = strings.ReplaceAll(cleaned, "\r\n", " ")
 	cleaned = strings.ReplaceAll(cleaned, "\n", " ")
 	cleaned = strings.ReplaceAll(cleaned, "\r", " ")

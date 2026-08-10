@@ -9,7 +9,7 @@ import (
     "testing"
     "time"
 
-    "bou.ke/monkey"
+    "github.com/agiledragon/gomonkey/v2"
 )
 
 var executionOrder []string
@@ -45,12 +45,9 @@ func generateReplayFiles(filePath string) error {
     return nil
 }
 
-func mockExecuteSQLAndRecord(task SQLTask, baseReplayOutputFilePath string) error {
+func mockExecuteSQLAndRecord(task SQLTask, w *replayWriter) error {
     // 模拟 SQL 执行时间
     time.Sleep(time.Duration(task.Entry.QueryTime) * time.Microsecond)
-
-    // 打印当前时间戳，连接号，SQL
-//    fmt.Printf("%s, 连接号: %s, SQL: %s\n", time.Now().Format("2006-01-02 15:04:05.000"), task.Entry.ConnectionID, task.Entry.SQL)
 
     // 记录执行顺序
     mu.Lock()
@@ -66,24 +63,7 @@ func mockExecuteSQLAndRecord(task SQLTask, baseReplayOutputFilePath string) erro
         ErrorInfo:     "",
     }
 
-    jsonData, err := json.Marshal(record)
-    if err != nil {
-        return err
-    }
-
-    replayOutputFilePath := fmt.Sprintf("%s.%s", baseReplayOutputFilePath, task.Entry.ConnectionID)
-    file, err := os.OpenFile(replayOutputFilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
-    if err != nil {
-        return err
-    }
-    defer file.Close()
-
-    _, err = file.Write(jsonData)
-    if err != nil {
-        return err
-    }
-    _, err = file.WriteString("\n")
-    return err
+    return w.writeRecord(record)
 }
 
 func TestSQLReplay(t *testing.T) {
@@ -98,24 +78,18 @@ func TestSQLReplay(t *testing.T) {
         t.Fatalf("Failed to generate replay files: %v", err)
     }
 
-    // 解析回放文件
-    tasksMap, _, err := ParseLogEntries(replayFilePath, "all", "all", "all")
-    if err != nil {
-        t.Fatalf("Failed to parse replay files: %v", err)
-    }
-
     // 清理之前的回放结果文件
-    for connID := range tasksMap {
-        os.Remove(fmt.Sprintf("%s.%s", replayOutputFilePath, connID))
+    for connID := 1; connID <= 4; connID++ {
+        os.Remove(fmt.Sprintf("%s.%d", replayOutputFilePath, connID))
     }
 
-    // 使用 monkey 补丁替换 ExecuteSQLAndRecord 函数
-    var patch = monkey.Patch(ExecuteSQLAndRecord, mockExecuteSQLAndRecord)
-    defer patch.Unpatch()
+    // 使用 gomonkey 替换 executeSQLAndRecord 函数
+    patch := gomonkey.ApplyFunc(executeSQLAndRecord, mockExecuteSQLAndRecord)
+    defer patch.Reset()
 
-    // 第一次回放，使用 1.0 倍速
+    // 第一次回放，使用 1.0 倍速（添加 lang 参数）
     start1 := time.Now()
-    StartSQLReplay("root1@tcp(127.0.0.1:4000)/test", speed1, replayFilePath, replayOutputFilePath, "all", "all", "all", "en")
+    StartSQLReplay("root1@tcp(127.0.0.1:4000)/test", speed1, replayFilePath, replayOutputFilePath, "all", "all", "all", "", "en")
     duration1 := time.Since(start1)
 
     // 验证 1.0 倍速回放时间
@@ -136,13 +110,18 @@ func TestSQLReplay(t *testing.T) {
     }
 
     // 清理之前的回放结果文件
-    for connID := range tasksMap {
-        os.Remove(fmt.Sprintf("%s.%s", replayOutputFilePath, connID))
+    for connID := 1; connID <= 4; connID++ {
+        os.Remove(fmt.Sprintf("%s.%d", replayOutputFilePath, connID))
     }
+
+    // 重置执行顺序
+    mu.Lock()
+    executionOrder = nil
+    mu.Unlock()
 
     // 第二次回放，使用 100.0 倍速
     start2 := time.Now()
-    StartSQLReplay("root1@tcp(127.0.0.1:4000)/test", speed100, replayFilePath, replayOutputFilePath, "all", "all", "all", "en")
+    StartSQLReplay("root1@tcp(127.0.0.1:4000)/test", speed100, replayFilePath, replayOutputFilePath, "all", "all", "all", "", "en")
     duration2 := time.Since(start2)
 
     // 验证 100.0 倍速回放时间
@@ -189,7 +168,7 @@ func TestSQLReplay(t *testing.T) {
             actualOutput = append(actualOutput, record)
         }
 
-        if err := scanner.Err(); err != nil {
+        if err := scanner.Err(); nil != err {
             t.Fatalf("Error reading replay output file: %v", err)
         }
 
@@ -211,7 +190,7 @@ func TestSQLReplay(t *testing.T) {
 
     // 清理测试文件
     os.Remove(replayFilePath)
-    for connID := range tasksMap {
-        os.Remove(fmt.Sprintf("%s.%s", replayOutputFilePath, connID))
+    for connID := 1; connID <= 4; connID++ {
+        os.Remove(fmt.Sprintf("%s.%d", replayOutputFilePath, connID))
     }
 }

@@ -55,6 +55,10 @@ func parseCSVLog(csvFilePath, slowOutputPath string) {
 	}
 
 	fmt.Fprintf(os.Stderr, "parse success, total record: %d (from %d file(s))\n", totalRecordCount, len(files))
+
+	if err := addCloseMarkers(slowOutputPath); err != nil {
+		fmt.Printf("Warning: failed to add close markers: %v\n", err)
+	}
 }
 
 func parseSingleCSVFile(filePath string, jsonEncoder *json.Encoder) int {
@@ -218,6 +222,7 @@ func convertToJSON(csvRecord *CSVRecord) (*LogEntry, error) {
 		end--
 	}
 	cleanedSQL := sql[start:end]
+	cleanedSQL = stripSQLInlineComments(cleanedSQL)
 
 	// 转换为JSON输出
 	jsonOutput := &LogEntry{
