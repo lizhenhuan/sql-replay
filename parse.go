@@ -15,6 +15,8 @@ import (
 	"github.com/pingcap/tidb/pkg/parser"
 )
 
+var mysqlSlowSchemaRegex = regexp.MustCompile(`(?:^|\s)Schema:(.*?)(?:\s+\w+:|$)`)
+
 func ParseLogs(slowLogPath, slowOutputPath string) {
 	if slowLogPath == "" || slowOutputPath == "" {
 		fmt.Println("Usage: ./sql-replay -mode parsemysqlslow -slow-in <path_to_slow_query_log_or_pattern> -slow-out <path_to_slow_output_file>")
@@ -147,6 +149,11 @@ func processQueryTimeAndRowsSent(line string, entry *LogEntry) {
 	matchRows := reRows.FindStringSubmatch(line)
 	if len(matchRows) > 1 {
 		entry.RowsSent, _ = strconv.Atoi(matchRows[1])
+	}
+
+	entry.DBName = ""
+	if match := mysqlSlowSchemaRegex.FindStringSubmatch(line); len(match) > 1 {
+		entry.DBName = strings.TrimSpace(match[1])
 	}
 }
 

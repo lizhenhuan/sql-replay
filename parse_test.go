@@ -92,7 +92,7 @@ SELECT c FROM sbtest1 WHERE id=250438;`
             RowsSent:     1,
             Username:     "coplo2o",
             SQLType:      "SELECT",
-            DBName:       "",
+            DBName:       "db",
             Timestamp:    1699229196,
         },
     }
