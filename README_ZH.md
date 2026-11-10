@@ -45,8 +45,11 @@ SELECT c FROM sbtest1 WHERE id=250438;
 
 ## parse 部分
 读取 MySQL 慢查询日志，去掉 MySQL 中自动生成的 set timestamp=xx/# Administor/-- 等无效 SQL，生成一个可以格式化的 json 文件，用于回放
+
+解析 MySQL 文本慢日志时，若 `# Query_time:` 行包含 `Schema:` 字段，会将其值写入 JSONL 的 `dbname`；字段缺失或为空时，`dbname` 为空字符串。
+
 ## replay 部分
-1. 读取 parse 阶段（或抓包工具 tshark 经 parse-tshark -mode parse2file）生成的格式化 json 文件，可过滤上游数据库用户、上游 SQL 类型（all、select）、上游数据库名（仅支持抓包工具采集的日志）来进行回放
+1. 读取 parse 阶段（或抓包工具 tshark 经 parse-tshark -mode parse2file）生成的格式化 json 文件，可过滤上游数据库用户、上游 SQL 类型（all、select）、上游数据库名（输入 JSONL 需包含对应的 `dbname`）来进行回放
 2. 根据 connection id 并行，相同 connection id 的 SQL 串行
 3. 将回放结果输出成 json 文件（按照 connection id 区分）
 ## load 部分

@@ -45,8 +45,10 @@ SELECT c FROM sbtest1 WHERE id=250438;
 ## Parse Section
 Reads MySQL slow query logs, removes invalid SQL such as automatically generated "set timestamp=xx/# Administrator/--", and generates a formattable JSON file for replay.
 
+For MySQL text slow logs, the `Schema:` field on the `# Query_time:` line is written to `dbname` in the output JSONL. If the field is missing or empty, `dbname` is an empty string.
+
 ## Replay Section
-1. Reads the formatted JSON file generated in the parse stage (or by parse-tshark -mode parse2file from packet capture tool tshark). Can filter upstream database users, upstream SQL types (all, select), and upstream database names (only supports logs collected by packet capture tools) for replay.
+1. Reads the formatted JSON file generated in the parse stage (or by parse-tshark -mode parse2file from packet capture tool tshark). Can filter upstream database users, upstream SQL types (all, select), and upstream database names (requires a populated `dbname` field in the input JSONL) for replay.
 2. Parallel execution based on connection id, serial execution for SQL with the same connection id.
 3. Outputs replay results to JSON files (separated by connection id).
 
